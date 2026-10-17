@@ -1,0 +1,122 @@
+name: SK1 HEVC experiment (Moonlight V+ 12.13.3)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AUDIO_HAPTICS_SDK_REF: b3f97c3bb7500ea7b1985aea568e5c7b40308d3b
+      AUDIO_HAPTICS_SDK_DIR: ${{ github.workspace }}/.deps/moonlight-audio-haptics
+    steps:
+      - name: Checkout upstream Moonlight V+ 12.13.3
+        uses: actions/checkout@v4
+        with:
+          repository: qiin2333/moonlight-vplus
+          ref: v12.13.3
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout required audio haptics SDK
+        uses: actions/checkout@v4
+        with:
+          repository: AlkaidLab/moonlight-audio-haptics
+          ref: ${{ env.AUDIO_HAPTICS_SDK_REF }}
+          path: .deps/moonlight-audio-haptics
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1'
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: yes | sdkmanager --licenses > /dev/null
+
+      - name: Apply SK1 diagnostic profiles
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          helper = Path('app/src/main/java/com/limelight/binding/video/MediaCodecHelper.kt')
+          code = helper.read_text(encoding='utf-8')
+          import_anchor = 'import com.limelight.LimeLog\n'
+          assert code.count(import_anchor) == 1, 'Unexpected MediaCodecHelper imports'
+          code = code.replace(import_anchor,
+              import_anchor + 'import com.limelight.preferences.PreferenceConfiguration\n', 1)
+
+          anchor = '        if (HevcLowLatencyPolicy.shouldSkipLowLatencyOptions(mimeType, decoderInfo.name, hevcLowLatencyMode)) {'
+          assert code.count(anchor) == 1, 'Unexpected MediaCodecHelper low-latency code'
+          replacement = '''        // SK1 diagnostic build. The normal "ON" profile sets several codec flags
+          // simultaneously. Here ON sets only the Android standard low-latency key.
+          // AUTO and OFF keep the standard V+ 12.13.3 low-latency skipping policy.
+          if (mimeType == "video/hevc" &&
+              decoderInfo.name.equals("c2.amlogic.hevc.decoder", ignoreCase = true) &&
+              hevcLowLatencyMode == PreferenceConfiguration.HEVC_LOW_LATENCY_ON
+          ) {
+              if (tryNumber == 0) {
+                  videoFormat.setInteger("low-latency", 1)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                      videoFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                  }
+                  LimeLog.info("SK1TEST ON: standard Android low-latency only; no Amlogic vendor flags")
+                  return true
+              }
+              // Retry with bare format if the decoder rejects the first attempt.
+              LimeLog.info("SK1TEST ON: retry without optional codec flags")
+              return false
+          }
+
+          ''' + anchor
+          code = code.replace(anchor, replacement, 1)
+          helper.write_text(code, encoding='utf-8')
+
+          renderer = Path('app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.kt')
+          code = renderer.read_text(encoding='utf-8')
+          anchor = '        this.asyncModeEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R'
+          assert code.count(anchor) == 1, 'Unexpected MediaCodecDecoderRenderer async code'
+          replacement = '''        // SK1 experiment: AUTO uses the synchronous MediaCodec path with
+          // low-latency OFF. This isolates the async callback path from the driver.
+          // Only use this test build with HEVC while comparing the three profiles.
+          this.asyncModeEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+              prefs.hevcLowLatencyMode != PreferenceConfiguration.HEVC_LOW_LATENCY_AUTO
+          LimeLog.info("SK1TEST profile=${prefs.hevcLowLatencyMode}, asyncMode=$asyncModeEnabled " +
+              "(ON=standard low-latency async; AUTO=no low-latency sync; OFF=no low-latency async)")'''
+          code = code.replace(anchor, replacement, 1)
+          renderer.write_text(code, encoding='utf-8')
+
+          print('SK1 experimental HEVC profiles successfully patched into V+ v12.13.3')
+          PY
+
+      - name: Show patched Kotlin and verify markers
+        shell: bash
+        run: |
+          grep -n 'SK1TEST' app/src/main/java/com/limelight/binding/video/MediaCodecHelper.kt
+          grep -n 'SK1TEST' app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.kt
+
+      - name: Build separate debug APK (does not replace normal V+)
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleNonRootDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: SK1-HEVC-VPlus-12_13_3-experiment-APK
+          path: app/build/outputs/apk/nonRoot/debug/*.apk
+          if-no-files-found: error
