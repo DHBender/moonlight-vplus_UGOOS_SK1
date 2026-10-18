@@ -1,7 +1,7 @@
 > [!NOTE]
-> **Ugoos SK1 / S928X-K — экспериментальная сборка Moonlight SK1 Texture v13.**  
-> [Русское описание, характеристики APK и подготовка релиза](docs/SK1_TEXTURE_V13_RELEASE.md).  
-> The supplied v13 APK is a separate diagnostic build. Its exact corresponding source changes and downloadable GitHub Release asset are **not yet published here**; please do not mistake upstream releases for this experiment.
+> **Ugoos SK1 / S928X-K — Moonlight SK1 Texture v14: HEVC 4K HDR проверено владельцем, плавный вывод и субъективно минимальная задержка.**  
+> [Русское описание версии v14, характеристики APK, SHA-256](docs/SK1_TEXTURE_V14_RELEASE.md) · [Архив заметок v13](docs/SK1_TEXTURE_V13_RELEASE.md).  
+> The v14 APK is a separate diagnostic build, not an upstream Moonlight V+ release. **The exact v14 source changes and downloadable GitHub Release asset are not yet published here.**
 
 ---
 
