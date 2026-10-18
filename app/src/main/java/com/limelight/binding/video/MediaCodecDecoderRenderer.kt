@@ -262,6 +262,18 @@ class MediaCodecDecoderRenderer(
     private var numFramesIn = 0
     private var numFramesOut = 0
 
+    // SK1 HEVC diagnostic counters: codec output callbacks vs codec-reported Surface render callbacks.
+    // A 60 FPS stream count is not proof of 60 unique HDMI frames.
+    private val sk1RateOutputBuffers = AtomicInteger(0)
+    private val sk1RateSurfaceCallbacks = AtomicInteger(0)
+    private var sk1RateLastReportMs = 0L
+    private val sk1RateDevice =
+        Build.MANUFACTURER.equals("UGOOS", ignoreCase = true) &&
+            Build.MODEL.equals("SK1", ignoreCase = true)
+    private val sk1RateHevcActive: Boolean
+        get() = sk1RateDevice &&
+            (getActiveVideoFormat() and MoonBridge.VIDEO_FORMAT_MASK_H265) != 0
+
     private fun findAvcDecoder(): MediaCodecInfo? {
         var decoder = MediaCodecHelper.findProbableSafeDecoder("video/avc", MediaCodecInfo.CodecProfileLevel.AVCProfileHigh)
         if (decoder == null) {
@@ -913,9 +925,15 @@ class MediaCodecDecoderRenderer(
             LimeLog.info("Decoder MediaFormat: KEY_MAX_INPUT_SIZE=$inputSizeOverride")
         }
 
-        // Avoid setting KEY_FRAME_RATE on Lollipop and earlier to reduce compatibility risk
+        // SK1 diagnostic B: Steam Link does not specify a codec frame-rate for HEVC.
+        // Try the same MediaFormat behavior for HEVC on SK1 only. Leave async mode and
+        // all low-latency keys unchanged.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, refreshRate)
+            if (sk1RateDevice && mimeType == "video/hevc") {
+                LimeLog.info("SK1RATE: KEY_FRAME_RATE omitted for SK1 HEVC; async and low latency unchanged")
+            } else {
+                videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, refreshRate)
+            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -1468,6 +1486,9 @@ class MediaCodecDecoderRenderer(
 
         if (USE_FRAME_RENDER_TIME && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             videoDecoder!!.setOnFrameRenderedListener({ _, presentationTimeUs, renderTimeNanos ->
+                if (sk1RateHevcActive) {
+                    sk1RateSurfaceCallbacks.incrementAndGet()
+                }
                 // 首帧实际显示到 surface 的时刻（最准的"画面已上屏"时机）
                 if (!firstFrameDelivered) {
                     firstFrameDelivered = true
@@ -1904,6 +1925,19 @@ class MediaCodecDecoderRenderer(
                 if (stopping) return
 
                 numFramesOut++
+                if (sk1RateHevcActive) {
+                    sk1RateOutputBuffers.incrementAndGet()
+                    val nowMs = SystemClock.elapsedRealtime()
+                    if (sk1RateLastReportMs == 0L) {
+                        sk1RateLastReportMs = nowMs
+                    } else if (nowMs - sk1RateLastReportMs >= 5000L) {
+                        val elapsedMs = nowMs - sk1RateLastReportMs
+                        val outputs = sk1RateOutputBuffers.getAndSet(0)
+                        val rendered = sk1RateSurfaceCallbacks.getAndSet(0)
+                        sk1RateLastReportMs = nowMs
+                        LimeLog.info("SK1RATE: codecOutput=$outputs surfaceRenderCallbacks=$rendered intervalMs=$elapsedMs")
+                    }
+                }
                 hdr10PlusOutputObserver.observeOutput(codec, index, info.presentationTimeUs)
 
                 // Deliver to frame pacing. Remove the host PTS before decoder-time tracking,
