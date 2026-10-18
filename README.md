@@ -1,3 +1,10 @@
+> [!NOTE]
+> **Ugoos SK1 / S928X-K — экспериментальная сборка Moonlight SK1 Texture v13.**  
+> [Русское описание, характеристики APK и подготовка релиза](docs/SK1_TEXTURE_V13_RELEASE.md).  
+> The supplied v13 APK is a separate diagnostic build. Its exact corresponding source changes and downloadable GitHub Release asset are **not yet published here**; please do not mistake upstream releases for this experiment.
+
+---
+
 <div align="center">
   <img src="./app/src/main/res/drawable/vplus.webp" width="100" alt="Moonlight V+ Logo">
 
