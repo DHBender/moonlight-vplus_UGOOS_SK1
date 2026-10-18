@@ -1522,8 +1522,17 @@ class MediaCodecDecoderRenderer(
             return 0
         }
 
-        // Async codec mode (API 30+)
-        this.asyncModeEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+        // SK1 diagnostic: use synchronous MediaCodec only for Amlogic HEVC on Ugoos SK1.
+        // Keep the stock HEVC low-latency MediaFormat parameters untouched.
+        // AV1, H.264 and all other devices retain the existing async MediaCodec path.
+        val sk1HevcSyncTest = Build.MANUFACTURER.equals("UGOOS", ignoreCase = true) &&
+            Build.MODEL.equals("SK1", ignoreCase = true) &&
+            (format and MoonBridge.VIDEO_FORMAT_MASK_H265) != 0 &&
+            hevcDecoder?.name?.equals("c2.amlogic.hevc.decoder", ignoreCase = true) == true
+        this.asyncModeEnabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !sk1HevcSyncTest
+        if (sk1HevcSyncTest) {
+            LimeLog.info("SK1SYNC: HEVC forced synchronous MediaCodec; low-latency options unchanged")
+        }
         if (asyncModeEnabled) {
             availableInputBuffers = ArrayBlockingQueue(ASYNC_INPUT_BUFFER_QUEUE_CAPACITY)
             codecCallbackThread = HandlerThread("Video - Codec", Process.THREAD_PRIORITY_DISPLAY)
