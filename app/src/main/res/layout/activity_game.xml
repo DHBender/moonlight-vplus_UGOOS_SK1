@@ -23,6 +23,16 @@
         <requestFocus />
     </com.limelight.ui.StreamView>
 
+    <!-- SK1 HEVC SDR diagnostic: composited output above StreamView, no input capture. -->
+    <TextureView
+        android:id="@+id/hevcTextureView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center"
+        android:clickable="false"
+        android:focusable="false"
+        android:visibility="gone" />
+
     <com.limelight.ui.CursorView
         android:id="@+id/cursorOverlay"
         android:layout_width="match_parent"
