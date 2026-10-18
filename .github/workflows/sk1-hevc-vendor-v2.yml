@@ -1,0 +1,163 @@
+name: SK1 HEVC vendor experiment v2 (Moonlight V+ 12.13.3)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/sk1-hevc-vendor-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AUDIO_HAPTICS_SDK_REF: b3f97c3bb7500ea7b1985aea568e5c7b40308d3b
+      AUDIO_HAPTICS_SDK_DIR: ${{ github.workspace }}/.deps/moonlight-audio-haptics
+    steps:
+      - name: Checkout upstream Moonlight V+ 12.13.3
+        uses: actions/checkout@v4
+        with:
+          repository: qiin2333/moonlight-vplus
+          ref: v12.13.3
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout required audio haptics SDK
+        uses: actions/checkout@v4
+        with:
+          repository: AlkaidLab/moonlight-audio-haptics
+          ref: ${{ env.AUDIO_HAPTICS_SDK_REF }}
+          path: .deps/moonlight-audio-haptics
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1'
+
+      # android-actions/setup-android already accepts required Android SDK licenses.
+      # A separate 'yes | sdkmanager --licenses' fails under bash pipefail with
+      # 'yes: standard output: Broken pipe' once sdkmanager stops reading.
+
+      - name: Patch SK1 V2 HEVC vendor profiles and application ID
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          helper = Path('app/src/main/java/com/limelight/binding/video/MediaCodecHelper.kt')
+          code = helper.read_text(encoding='utf-8')
+          import_anchor = 'import com.limelight.LimeLog\n'
+          assert code.count(import_anchor) == 1, 'Unexpected MediaCodecHelper imports'
+          code = code.replace(import_anchor,
+              import_anchor + 'import com.limelight.preferences.PreferenceConfiguration\n', 1)
+          anchor = '        if (HevcLowLatencyPolicy.shouldSkipLowLatencyOptions(mimeType, decoderInfo.name, hevcLowLatencyMode)) {'
+          assert code.count(anchor) == 1, 'Unexpected MediaCodecHelper low-latency block'
+          patch = '''        // SK1V2: Test Amlogic vendor low-latency keys independently of the
+                  // Android standard KEY_LOW_LATENCY, which caused slideshow.
+                  // ON   = vdec-lowlatency + vendor.low-latency.enable
+                  // AUTO = vdec-lowlatency only
+                  // OFF  = vendor.low-latency.enable only
+                  // The rest of V+ 12.13.3 uses its unchanged low-latency policy.
+                  if (mimeType == "video/hevc" &&
+                      decoderInfo.name.equals("c2.amlogic.hevc.decoder", ignoreCase = true)
+                  ) {
+                      if (tryNumber == 0) {
+                          val profileName = when (hevcLowLatencyMode) {
+                              PreferenceConfiguration.HEVC_LOW_LATENCY_ON -> {
+                                  videoFormat.setInteger("vdec-lowlatency", 1)
+                                  videoFormat.setInteger("vendor.low-latency.enable", 1)
+                                  "vdec+vendor"
+                              }
+                              PreferenceConfiguration.HEVC_LOW_LATENCY_AUTO -> {
+                                  videoFormat.setInteger("vdec-lowlatency", 1)
+                                  "vdec-only"
+                              }
+                              else -> {
+                                  videoFormat.setInteger("vendor.low-latency.enable", 1)
+                                  "vendor-only"
+                              }
+                          }
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                              videoFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                          }
+                          LimeLog.info("SK1V2: HEVC profile=$profileName; Android KEY_LOW_LATENCY is NOT set")
+                          return true
+                      }
+                      LimeLog.info("SK1V2: configure retry without low-latency keys (try=$tryNumber)")
+                      return false
+                  }
+
+          '''
+          code=code.replace(anchor,patch+anchor,1)
+          helper.write_text(code,encoding='utf-8')
+
+          # Keep V1 and regular V+ installed: use a new debug package ID.
+          gradle=Path('app/build.gradle')
+          code=gradle.read_text(encoding='utf-8')
+          anchor='''        debug {
+                      applicationIdSuffix ".vplus_debug"
+                      resValue "string", "app_label", audioHapticsAppLabel'''
+          assert code.count(anchor)==1, 'Unexpected debug app ID or label'
+          code=code.replace(anchor,'''        debug {
+                      applicationIdSuffix ".vplus_sk1v2"
+                      resValue "string", "app_label", "Moonlight SK1 v2"''',1)
+          gradle.write_text(code,encoding='utf-8')
+
+          # Make menu labels reflect TEST profile meanings, not stock semantics.
+          maps=[
+              ('app/src/main/res/values-ru/strings.xml', {
+                  '<string name="title_hevc_low_latency_mode">HEVC с малой задержкой</string>': '<string name="title_hevc_low_latency_mode">SK1 HEVC: тестовые профили</string>',
+                  '<string name="summary_hevc_low_latency_mode">Авто: совместимый режим для Amlogic HEVC. Вкл.: режим малой задержки. Выкл.: совместимый режим для всех HEVC и Dolby Vision. Совместимый режим может повысить задержку.</string>': '<string name="summary_hevc_low_latency_mode">Вкл.: vdec + vendor. Авто: только vdec. Выкл.: только vendor. Стандартная малая задержка Android не используется.</string>',
+                  '<string name="hevc_low_latency_auto">Авто</string>': '<string name="hevc_low_latency_auto">Авто: только vdec</string>',
+                  '<string name="hevc_low_latency_on">Вкл.</string>': '<string name="hevc_low_latency_on">Вкл.: vdec + vendor</string>',
+                  '<string name="hevc_low_latency_off">Выкл.</string>': '<string name="hevc_low_latency_off">Выкл.: только vendor</string>'
+              }),
+              ('app/src/main/res/values/strings.xml', {
+                  '<string name="title_hevc_low_latency_mode">HEVC low-latency decoding</string>': '<string name="title_hevc_low_latency_mode">SK1 HEVC test profiles</string>',
+                  '<string name="summary_hevc_low_latency_mode">Auto uses compatibility settings for Amlogic HEVC decoders. On restores low-latency options; Off uses compatibility settings for all HEVC and Dolby Vision streams. Compatibility settings may increase decoding latency.</string>': '<string name="summary_hevc_low_latency_mode">On: vdec + vendor. Auto: vdec only. Off: vendor only. Standard Android low-latency is not used.</string>',
+                  '<string name="hevc_low_latency_auto">Auto</string>': '<string name="hevc_low_latency_auto">Auto: vdec only</string>',
+                  '<string name="hevc_low_latency_on">On</string>': '<string name="hevc_low_latency_on">On: vdec + vendor</string>',
+                  '<string name="hevc_low_latency_off">Off</string>': '<string name="hevc_low_latency_off">Off: vendor only</string>'
+              })
+          ]
+          for path, changes in maps:
+              f=Path(path)
+              txt=f.read_text(encoding='utf-8')
+              for old_value,new_value in changes.items():
+                  assert txt.count(old_value)==1, f'Missing resource match: {path}: {old_value}'
+                  txt=txt.replace(old_value,new_value,1)
+              f.write_text(txt,encoding='utf-8')
+          print('SK1V2 source patch successfully applied')
+          PY
+
+      - name: Show patched Kotlin and verify markers
+        shell: bash
+        run: |
+          grep -n 'SK1V2' app/src/main/java/com/limelight/binding/video/MediaCodecHelper.kt
+          grep -n 'vplus_sk1v2' app/build.gradle
+          grep -n 'hevc_low_latency_auto' app/src/main/res/values-ru/strings.xml
+
+      - name: Build separate debug APK (does not replace normal V+)
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleNonRootDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: SK1-HEVC-VPlus-12_13_3-VENDOR-V2-APK
+          path: app/build/outputs/apk/nonRoot/debug/*.apk
+          if-no-files-found: error
