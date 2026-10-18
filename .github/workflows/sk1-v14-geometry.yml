@@ -1,0 +1,26 @@
+name: SK1 v14 HEVC geometry verification
+
+on:
+  pull_request:
+    paths:
+      - 'research/sk1-v14/**'
+      - '.github/workflows/sk1-v14-geometry.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  geometry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Compile and test independent HEVC geometry reconstruction
+        run: |
+          mkdir -p "$RUNNER_TEMP/sk1-test-classes"
+          javac -d "$RUNNER_TEMP/sk1-test-classes" research/sk1-v14/HevcGeometry.java research/sk1-v14/HevcGeometryTest.java
+          java -cp "$RUNNER_TEMP/sk1-test-classes" com.limelight.sk1.HevcGeometryTest
