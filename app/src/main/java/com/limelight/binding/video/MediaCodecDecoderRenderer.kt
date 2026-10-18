@@ -158,6 +158,13 @@ class MediaCodecDecoderRenderer(
     private var initialHeight = 0
     private var videoFormat = 0
     private var renderTarget: SurfaceHolder? = null
+
+    // SK1 HEVC SDR diagnostic: MediaCodec stays hardware accelerated.
+    @Volatile private var hevcTextureOutputSurface: Surface? = null
+
+    fun setHevcTextureOutputSurface(surface: Surface?) {
+        hevcTextureOutputSurface = surface
+    }
     private val pyrowaveDecoder = PyrowaveDecoderSession(
         gpuNative = FramegenPyrowaveNativeApi,
         onFatalFailure = { reason -> failPyrowaveSession(reason) },
@@ -1073,6 +1080,15 @@ class MediaCodecDecoderRenderer(
         fun directOutputSurface(): Surface =
             renderTarget?.surface
                 ?: throw IllegalArgumentException("Render target was released before decoder configuration")
+        // Only forced SDR HEVC receives this Surface (Game controls the opt-in).
+        val sk1HevcTextureSurface = if (
+            format.getString(MediaFormat.KEY_MIME) == "video/hevc" &&
+            !requestedHdr && pendingFramegenSurface == null
+        ) {
+            hevcTextureOutputSurface?.takeIf { it.isValid }
+        } else {
+            null
+        }
         val outSurface = if (framegenOutputSwitchPending) {
             LimeLog.info(
                 "Framegen delayed capture active: decoder starts on SurfaceView " +
@@ -1083,7 +1099,10 @@ class MediaCodecDecoderRenderer(
             if (pendingFramegenSurface != null) {
                 LimeLog.info("Framegen capture surface active (decoder output redirected to ImageReader)")
             }
-            pendingFramegenSurface ?: directOutputSurface()
+            pendingFramegenSurface ?: sk1HevcTextureSurface ?: directOutputSurface()
+        }
+        if (outSurface === sk1HevcTextureSurface && sk1HevcTextureSurface != null) {
+            LimeLog.info("SK1 HEVC TextureView EXPERIMENT ACTIVE: hardware decoder -> SurfaceTexture")
         }
         videoDecoder!!.configure(format, outSurface, null, 0)
 
