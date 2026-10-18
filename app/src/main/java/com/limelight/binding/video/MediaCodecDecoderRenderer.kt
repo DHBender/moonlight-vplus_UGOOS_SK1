@@ -925,14 +925,12 @@ class MediaCodecDecoderRenderer(
             LimeLog.info("Decoder MediaFormat: KEY_MAX_INPUT_SIZE=$inputSizeOverride")
         }
 
-        // SK1 diagnostic B: Steam Link does not specify a codec frame-rate for HEVC.
-        // Try the same MediaFormat behavior for HEVC on SK1 only. Leave async mode and
-        // all low-latency keys unchanged.
+        // SK1 presentation test: restore stock frame-rate configuration. The
+        // previous experiment without KEY_FRAME_RATE delayed first picture on static content.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, refreshRate)
             if (sk1RateDevice && mimeType == "video/hevc") {
-                LimeLog.info("SK1RATE: KEY_FRAME_RATE omitted for SK1 HEVC; async and low latency unchanged")
-            } else {
-                videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, refreshRate)
+                LimeLog.info("SK1PRESENT: KEY_FRAME_RATE restored=$refreshRate")
             }
         }
 
@@ -1863,6 +1861,19 @@ class MediaCodecDecoderRenderer(
      * not go through this method.
      */
     private fun deliverDecodedFrame(bufferIndex: Int, hostPtsUs: Long = -1L) {
+        // SK1 diagnostic C: avoid all Moonlight presentation schedulers. Send
+        // every decoded HEVC frame to Surface immediately using the boolean
+        // MediaCodec API, instead of a timestamp (0 or target nanoTime).
+        if (sk1RateHevcActive) {
+            try {
+                videoDecoder!!.releaseOutputBuffer(bufferIndex, true)
+                activeWindowVideoStats.totalFramesRendered++
+                frameIntervalTracker.recordFrame()
+            } catch (e: IllegalStateException) {
+                handleDecoderException(e)
+            }
+            return
+        }
         if (prefs.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED ||
             prefs.framePacing == PreferenceConfiguration.FRAME_PACING_EXPERIMENTAL_LOW_LATENCY ||
             prefs.framePacing == PreferenceConfiguration.FRAME_PACING_PRECISE_SYNC
@@ -2160,7 +2171,11 @@ class MediaCodecDecoderRenderer(
             return
         }
         startRendererThread()
-        framePacingController.start(videoDecoder!!, refreshRate)
+        if (sk1RateHevcActive) {
+            LimeLog.info("SK1PRESENT: HEVC direct render=true; PreciseSync/Choreographer disabled; codec async kept")
+        } else {
+            framePacingController.start(videoDecoder!!, refreshRate)
+        }
 
         // Start thermal monitoring to warn about throttling
         perfBoostManager.startThermalMonitoring { status ->
