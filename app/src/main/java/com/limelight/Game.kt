@@ -88,6 +88,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Point
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.hardware.input.InputManager
 import android.media.AudioManager
 import android.net.ConnectivityManager
@@ -104,6 +105,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
+import android.view.TextureView
 import android.view.View
 import android.view.View.OnGenericMotionListener
 import android.view.View.OnSystemUiVisibilityChangeListener
@@ -252,6 +254,17 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     private var pipOverlayRestoreGeneration = 0L
     private var autoEnterPip = false
     private var surfaceCreated = false
+
+    // The existing StreamView still owns input, focus, keyboard and controller events.
+    private var sk1HevcTextureView: TextureView? = null
+    private var sk1HevcTextureSurface: Surface? = null
+    private data class PendingSk1SurfaceChange(
+        val holder: SurfaceHolder,
+        val format: Int,
+        val width: Int,
+        val height: Int,
+    )
+    private var pendingSk1SurfaceChange: PendingSk1SurfaceChange? = null
     var attemptedConnection = false
     var analyticsManager: AnalyticsManager? = null
     var streamStartTime: Long = 0
@@ -437,6 +450,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         streamView.setOnGenericMotionListener(this)
         streamView.setOnKeyListener(this)
         streamView.setInputCallbacks(this)
+        installSk1HevcTextureView()
         installStartHoldWheelOverlay(streamView.parent as FrameLayout)
 
         if (prefConfig.screenDs5Touchpad) {
@@ -669,6 +683,76 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     /** Resolve the display currently used for rendering (external or built-in). */
     val currentTargetDisplay: Display
         get() = targetDisplayResolver.currentDisplay()
+
+    /**
+     * Amlogic HEVC SDR diagnostic; does not apply to HDR, AV1, framegen,
+     * external displays or AUTO. Choose FORCE_HEVC to enable.
+     */
+    private fun installSk1HevcTextureView() {
+        if (prefConfig.videoFormat != PreferenceConfiguration.FormatOption.FORCE_HEVC ||
+            prefConfig.enableHdr || targetDisplayResolver.isExternalDisplaySelected() ||
+            FramegenRuntimePlanner.shouldUse(
+                defaultPreferences(), prefConfig.width, prefConfig.height, prefConfig.fps
+            )
+        ) {
+            LimeLog.info("SK1 HEVC TextureView INACTIVE: requires forced HEVC SDR, no framegen/external display")
+            return
+        }
+        val textureView = findViewById<TextureView>(R.id.hevcTextureView)
+        sk1HevcTextureView = textureView
+        textureView.isOpaque = true
+        textureView.isClickable = false
+        textureView.isFocusable = false
+        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+                sk1HevcTextureSurface?.release()
+                sk1HevcTextureSurface = Surface(surfaceTexture)
+                LimeLog.info("SK1 HEVC TextureView surface ready: ${width}x${height}")
+                decoderRenderer?.setHevcTextureOutputSurface(sk1HevcTextureSurface)
+                val pending = pendingSk1SurfaceChange
+                if (pending != null) {
+                    pendingSk1SurfaceChange = null
+                    surfaceChanged(pending.holder, pending.format, pending.width, pending.height)
+                }
+            }
+
+            override fun onSurfaceTextureSizeChanged(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+                LimeLog.info("SK1 HEVC TextureView resized: ${width}x${height}")
+            }
+
+            override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+                decoderRenderer?.setHevcTextureOutputSurface(null)
+                if (attemptedConnection) {
+                    decoderRenderer?.prepareForStop()
+                    if (connected && ::connectionCallbackHandler.isInitialized) {
+                        connectionCallbackHandler.stopConnection()
+                    }
+                }
+                sk1HevcTextureSurface?.release()
+                sk1HevcTextureSurface = null
+                pendingSk1SurfaceChange = null
+                return true // TextureView releases the SurfaceTexture.
+            }
+
+            override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) = Unit
+        }
+        textureView.visibility = View.VISIBLE
+        streamView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            alignSk1HevcTextureView()
+        }
+        streamView.post { alignSk1HevcTextureView() }
+        LimeLog.info("SK1 HEVC TextureView experiment enabled; waiting for output surface")
+    }
+
+    private fun alignSk1HevcTextureView() {
+        val textureView = sk1HevcTextureView ?: return
+        if (streamView.width <= 0 || streamView.height <= 0) return
+        val params = textureView.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (params.width == streamView.width && params.height == streamView.height) return
+        params.width = streamView.width
+        params.height = streamView.height
+        textureView.layoutParams = params
+    }
 
     /** Resolve the StreamView coordinate space for motion callbacks that don't pass a view. */
     private fun getMotionEventTargetView(): StreamView = activeStreamView ?: streamView
@@ -2815,6 +2899,18 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         if (!surfaceCreated) {
             throw IllegalStateException("Surface changed before creation!")
+        }
+
+        // Don't start until TextureView is ready. Otherwise a SurfaceView fallback
+        // would make the diagnostic outcome meaningless.
+        if (sk1HevcTextureView != null) {
+            val textureSurface = sk1HevcTextureSurface
+            if (textureSurface == null || !textureSurface.isValid) {
+                pendingSk1SurfaceChange = PendingSk1SurfaceChange(holder, format, width, height)
+                LimeLog.info("SK1 HEVC: waiting for TextureView before connecting")
+                return
+            }
+            decoderRenderer?.setHevcTextureOutputSurface(textureSurface)
         }
 
         val shouldPrepareFramegen =
