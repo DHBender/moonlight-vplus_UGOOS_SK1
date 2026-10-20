@@ -1,0 +1,38 @@
+name: Publish SK1 Texture v14 pre-release
+on:
+  push:
+    branches:
+      - release/sk1-texture-v14
+    paths:
+      - '.github/workflows/publish-sk1-texture-v14.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+      - name: Create annotated pre-release (without APK)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="sk1-texture-v14"
+          TITLE="Moonlight SK1 Texture v14 - tested HEVC 4K HDR (Ugoos SK1)"
+          NOTES=".github/releases/sk1-texture-v14.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; keeping existing release and attachments."
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file "$NOTES" \
+              --prerelease
+          fi
+          gh release view "$TAG" --json url,tagName,isPrerelease,assets
