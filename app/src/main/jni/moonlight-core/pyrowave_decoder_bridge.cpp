@@ -140,6 +140,15 @@ struct api_t {
   }
 };
 
+enum class submit_outcome {
+  presented,
+  not_ready,
+  push_failed,
+  decode_failed,
+  rejected,
+  present_failed,
+};
+
 struct decoder_t {
   api_t api;
   pyrowave_device device = nullptr;
@@ -158,10 +167,104 @@ struct decoder_t {
   std::uint64_t present_post_total_us = 0;
   std::uint64_t last_decode_time_us = 0;
   std::uint64_t last_present_time_us = 0;
+
+  // Pipeline timings: count all attempted frames, not only presented ones.
+  // This makes the diagnosis useful while a 15-frame queue is overflowing.
+  std::uint32_t pipeline_attempts = 0;
+  std::uint32_t pipeline_ready_calls = 0;
+  std::uint32_t pipeline_cpu_calls = 0;
+  std::uint32_t pipeline_present_calls = 0;
+  std::uint32_t pipeline_presented = 0;
+  std::uint32_t pipeline_not_ready = 0;
+  std::uint32_t pipeline_push_failed = 0;
+  std::uint32_t pipeline_decode_failed = 0;
+  std::uint32_t pipeline_rejected = 0;
+  std::uint32_t pipeline_present_failed = 0;
+  std::uint64_t pipeline_payload_bytes = 0;
+  std::uint64_t pipeline_push_total_us = 0;
+  std::uint64_t pipeline_ready_total_us = 0;
+  std::uint64_t pipeline_cpu_total_us = 0;
+  std::uint64_t pipeline_present_total_us = 0;
   std::vector<std::uint8_t> y;
   std::vector<std::uint8_t> u;
   std::vector<std::uint8_t> v;
   std::mutex mutex;
+
+  static std::uint64_t elapsed_us(
+      std::chrono::steady_clock::time_point start,
+      std::chrono::steady_clock::time_point end) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+  }
+
+  // Called only under decoder->mutex on the decoder submission thread.
+  void profile_pipeline(std::size_t payload_bytes, std::uint64_t push_us,
+                        std::uint64_t ready_us, bool ready_called,
+                        std::uint64_t cpu_us, bool cpu_called,
+                        std::uint64_t present_us, bool present_called,
+                        submit_outcome outcome) noexcept {
+    constexpr std::uint32_t kWindow = 120;
+    ++pipeline_attempts;
+    pipeline_payload_bytes += payload_bytes;
+    pipeline_push_total_us += push_us;
+    if (ready_called) {
+      ++pipeline_ready_calls;
+      pipeline_ready_total_us += ready_us;
+    }
+    if (cpu_called) {
+      ++pipeline_cpu_calls;
+      pipeline_cpu_total_us += cpu_us;
+    }
+    if (present_called) {
+      ++pipeline_present_calls;
+      pipeline_present_total_us += present_us;
+    }
+    switch (outcome) {
+      case submit_outcome::presented: ++pipeline_presented; break;
+      case submit_outcome::not_ready: ++pipeline_not_ready; break;
+      case submit_outcome::push_failed: ++pipeline_push_failed; break;
+      case submit_outcome::decode_failed: ++pipeline_decode_failed; break;
+      case submit_outcome::rejected: ++pipeline_rejected; break;
+      case submit_outcome::present_failed: ++pipeline_present_failed; break;
+    }
+
+    if (pipeline_attempts < kWindow) {
+      return;
+    }
+    const auto avg_ms = [](std::uint64_t micros, std::uint32_t count) noexcept {
+      return count ? (static_cast<double>(micros) / (1000.0 * count)) : 0.0;
+    };
+    __android_log_print(ANDROID_LOG_INFO, "SK1-PYROWAVE",
+        "pipeline %dx%d: push=%.2fms ready=%.2fms cpuDecode=%.2fms "
+        "surface=%.2fms payload=%.1fKB "
+        "frames[attempts=%u shown=%u notReady=%u pushFail=%u decodeFail=%u "
+        "rejected=%u presentFail=%u]",
+        width, height,
+        avg_ms(pipeline_push_total_us, pipeline_attempts),
+        avg_ms(pipeline_ready_total_us, pipeline_ready_calls),
+        avg_ms(pipeline_cpu_total_us, pipeline_cpu_calls),
+        avg_ms(pipeline_present_total_us, pipeline_present_calls),
+        static_cast<double>(pipeline_payload_bytes) / (1024.0 * pipeline_attempts),
+        pipeline_attempts, pipeline_presented, pipeline_not_ready,
+        pipeline_push_failed, pipeline_decode_failed,
+        pipeline_rejected, pipeline_present_failed);
+
+    pipeline_attempts = 0;
+    pipeline_ready_calls = 0;
+    pipeline_cpu_calls = 0;
+    pipeline_present_calls = 0;
+    pipeline_presented = 0;
+    pipeline_not_ready = 0;
+    pipeline_push_failed = 0;
+    pipeline_decode_failed = 0;
+    pipeline_rejected = 0;
+    pipeline_present_failed = 0;
+    pipeline_payload_bytes = 0;
+    pipeline_push_total_us = 0;
+    pipeline_ready_total_us = 0;
+    pipeline_cpu_total_us = 0;
+    pipeline_present_total_us = 0;
+  }
 
   ~decoder_t() {
     std::lock_guard<std::mutex> lock { mutex };
@@ -459,19 +562,31 @@ Java_com_limelight_nvstream_jni_MoonBridge_pyrowaveSubmit(JNIEnv *env, jclass, j
     const auto decode_start = std::chrono::steady_clock::now();
     const auto push_result = decoder->api.push_packet(
         decoder->decoder, bytes, static_cast<std::size_t>(length));
+    const auto push_end = std::chrono::steady_clock::now();
     env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
     bytes = nullptr;
+    const auto push_us = decoder_t::elapsed_us(decode_start, push_end);
     if (push_result != PYROWAVE_SUCCESS) {
+      decoder->profile_pipeline(length, push_us, 0, false, 0, false, 0, false,
+                                submit_outcome::push_failed);
       return -1;
     }
-    if (!decoder->api.is_ready(decoder->decoder, false)) {
+    const auto ready_start = std::chrono::steady_clock::now();
+    const bool ready = decoder->api.is_ready(decoder->decoder, false);
+    const auto ready_end = std::chrono::steady_clock::now();
+    const auto ready_us = decoder_t::elapsed_us(ready_start, ready_end);
+    if (!ready) {
       // Keep the decoder and Surface alive so the compositor continues to
       // show the last successfully presented frame.
       decoder->api.clear_decoder(decoder->decoder);
+      decoder->profile_pipeline(length, push_us, ready_us, true, 0, false, 0, false,
+                                submit_outcome::not_ready);
       return PYROWAVE_SUBMIT_FRAME_DROPPED;
     }
     pyrowave_color_metadata metadata {};
     if (!decoder->api.get_color_metadata(decoder->decoder, &metadata)) {
+      decoder->profile_pipeline(length, push_us, ready_us, true, 0, false, 0, false,
+                                submit_outcome::rejected);
       return -1;
     }
     const bool expected_hdr = decoder->hdr_mode != 0;
@@ -485,6 +600,8 @@ Java_com_limelight_nvstream_jni_MoonBridge_pyrowaveSubmit(JNIEnv *env, jclass, j
                            metadata.transfer != PYROWAVE_TRANSFER_BT709 ||
                            metadata.transform != PYROWAVE_YCBCR_BT709)) ||
         metadata.range != (decoder->full_range ? PYROWAVE_YCBCR_FULL : PYROWAVE_YCBCR_LIMITED)) {
+      decoder->profile_pipeline(length, push_us, ready_us, true, 0, false, 0, false,
+                                submit_outcome::rejected);
       return -1;
     }
 
@@ -498,17 +615,26 @@ Java_com_limelight_nvstream_jni_MoonBridge_pyrowaveSubmit(JNIEnv *env, jclass, j
       .height = decoder->height,
       .format = PYROWAVE_CPU_BUFFER_FORMAT_YUV420P,
     };
-    if (decoder->api.decode_cpu(decoder->decoder, &output) != PYROWAVE_SUCCESS) {
+    const auto cpu_start = std::chrono::steady_clock::now();
+    const auto cpu_result = decoder->api.decode_cpu(decoder->decoder, &output);
+    const auto decode_end = std::chrono::steady_clock::now();
+    const auto cpu_us = decoder_t::elapsed_us(cpu_start, decode_end);
+    if (cpu_result != PYROWAVE_SUCCESS) {
+      decoder->profile_pipeline(length, push_us, ready_us, true, cpu_us, true, 0, false,
+                                submit_outcome::decode_failed);
       return -1;
     }
-    const auto decode_end = std::chrono::steady_clock::now();
+
     const auto present_start = decode_end;
     const bool presented = decoder->present();
     const auto present_end = std::chrono::steady_clock::now();
-    decoder->last_decode_time_us = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(decode_end - decode_start).count());
-    decoder->last_present_time_us = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(present_end - present_start).count());
+    const auto present_us = decoder_t::elapsed_us(present_start, present_end);
+    decoder->last_decode_time_us = decoder_t::elapsed_us(decode_start, decode_end);
+    decoder->last_present_time_us = present_us;
+    decoder->profile_pipeline(length, push_us, ready_us, true, cpu_us, true,
+                              present_us, true,
+                              presented ? submit_outcome::presented
+                                        : submit_outcome::present_failed);
     return presented ? 0 : -1;
   } catch (...) {
     if (bytes != nullptr) {
