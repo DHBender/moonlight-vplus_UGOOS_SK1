@@ -12,11 +12,13 @@
 
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+#include <android/log.h>
 #include <dlfcn.h>
 #include <vulkan/vulkan.h>
 
 #include "pyrowave_api.h"
 #include "pyrowave_capabilities.h"
+#include "pyrowave_sdr_fast_convert.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -145,6 +147,11 @@ struct decoder_t {
   bool full_range = false;
   int hdr_mode = 0;
   bool geometry_set = false;
+  std::unique_ptr<sk1_pyrowave::Bt709Lut> bt709_lut;
+  std::uint32_t present_sample_count = 0;
+  std::uint64_t present_lock_total_us = 0;
+  std::uint64_t present_convert_total_us = 0;
+  std::uint64_t present_post_total_us = 0;
   std::uint64_t last_decode_time_us = 0;
   std::uint64_t last_present_time_us = 0;
   std::vector<std::uint8_t> y;
@@ -190,6 +197,7 @@ struct decoder_t {
       }
       geometry_set = true;
     }
+    const auto lock_start = std::chrono::steady_clock::now();
     ANativeWindow_Buffer buffer {};
     if (ANativeWindow_lock(window, &buffer, nullptr) != 0) {
       return false;
@@ -205,28 +213,40 @@ struct decoder_t {
       ANativeWindow_unlockAndPost(window);
       return false;
     }
+    const auto lock_end = std::chrono::steady_clock::now();
     const auto dst_stride = static_cast<std::size_t>(buffer.stride) * 4u;
-    for (int row = 0; row < copy_height; ++row) {
-      auto *dst = static_cast<std::uint8_t *>(buffer.bits) + static_cast<std::size_t>(row) * dst_stride;
-      for (int col = 0; col < copy_width; ++col) {
-        const auto y_index = static_cast<std::size_t>(row) * width + col;
-        const auto uv_index = static_cast<std::size_t>(row / 2) * (width / 2) + (col / 2);
-        const float luma = full_range
-          ? static_cast<float>(y[y_index])
-          : (static_cast<float>(y[y_index]) - 16.0f) * (255.0f / 219.0f);
-        const float cb_scale = full_range ? 1.0f : (255.0f / 224.0f);
-        const float cb = (static_cast<float>(u[uv_index]) - 128.0f) * cb_scale;
-        const float cr = (static_cast<float>(v[uv_index]) - 128.0f) * cb_scale;
-        const auto red = static_cast<std::uint8_t>(std::clamp(std::lround(luma + 1.5748f * cr), 0l, 255l));
-        const auto green = static_cast<std::uint8_t>(std::clamp(std::lround(luma - 0.1873f * cb - 0.4681f * cr), 0l, 255l));
-        const auto blue = static_cast<std::uint8_t>(std::clamp(std::lround(luma + 1.8556f * cb), 0l, 255l));
-        dst[static_cast<std::size_t>(col) * 4u + 0] = red;
-        dst[static_cast<std::size_t>(col) * 4u + 1] = green;
-        dst[static_cast<std::size_t>(col) * 4u + 2] = blue;
-        dst[static_cast<std::size_t>(col) * 4u + 3] = 255;
+    sk1_pyrowave::i420_to_rgba(
+        y.data(), u.data(), v.data(), width,
+        static_cast<std::uint8_t *>(buffer.bits), dst_stride,
+        copy_width, copy_height, *bt709_lut);
+    const auto convert_end = std::chrono::steady_clock::now();
+    const bool posted = ANativeWindow_unlockAndPost(window) == 0;
+    const auto post_end = std::chrono::steady_clock::now();
+
+    // Each diagnostic is an average over 120 successful frames rather than
+    // logging on every frame (which would itself perturb 60 FPS performance).
+    if (posted) {
+      const auto micros = [](auto end, auto start) -> std::uint64_t {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+      };
+      present_lock_total_us += micros(lock_end, lock_start);
+      present_convert_total_us += micros(convert_end, lock_end);
+      present_post_total_us += micros(post_end, convert_end);
+      if (++present_sample_count == 120) {
+        __android_log_print(ANDROID_LOG_INFO, "SK1-PYROWAVE",
+            "CPU staging %dx%d: lock=%.2fms convert=%.2fms post=%.2fms (avg/120)",
+            width, height,
+            present_lock_total_us / 120000.0,
+            present_convert_total_us / 120000.0,
+            present_post_total_us / 120000.0);
+        present_sample_count = 0;
+        present_lock_total_us = 0;
+        present_convert_total_us = 0;
+        present_post_total_us = 0;
       }
     }
-    return ANativeWindow_unlockAndPost(window) == 0;
+    return posted;
   }
 };
 
@@ -364,6 +384,7 @@ Java_com_limelight_nvstream_jni_MoonBridge_pyrowaveCreate(JNIEnv *, jclass, jint
     decoder->height = height;
     decoder->hdr_mode = hdr_mode;
     decoder->full_range = full_range;
+    decoder->bt709_lut = std::make_unique<sk1_pyrowave::Bt709Lut>(full_range != JNI_FALSE);
     const auto luma_size = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     const auto chroma_size = static_cast<std::size_t>(width / 2) * static_cast<std::size_t>(height / 2);
     decoder->y.resize(luma_size);
