@@ -19,6 +19,9 @@
 #include "pyrowave_api.h"
 #include "pyrowave_capabilities.h"
 #include "pyrowave_sdr_fast_convert.hpp"
+#if defined(__arm__) && !defined(__aarch64__)
+#include <cpu-features.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -148,6 +151,7 @@ struct decoder_t {
   int hdr_mode = 0;
   bool geometry_set = false;
   std::unique_ptr<sk1_pyrowave::Bt709Lut> bt709_lut;
+  bool use_neon = false;
   std::uint32_t present_sample_count = 0;
   std::uint64_t present_lock_total_us = 0;
   std::uint64_t present_convert_total_us = 0;
@@ -215,10 +219,20 @@ struct decoder_t {
     }
     const auto lock_end = std::chrono::steady_clock::now();
     const auto dst_stride = static_cast<std::size_t>(buffer.stride) * 4u;
-    sk1_pyrowave::i420_to_rgba(
-        y.data(), u.data(), v.data(), width,
-        static_cast<std::uint8_t *>(buffer.bits), dst_stride,
-        copy_width, copy_height, *bt709_lut);
+#if defined(__arm__) && !defined(__aarch64__)
+    if (use_neon) {
+      sk1_pyrowave::i420_to_rgba_neon(
+          y.data(), u.data(), v.data(), width,
+          static_cast<std::uint8_t *>(buffer.bits), dst_stride,
+          copy_width, copy_height, full_range);
+    } else
+#endif
+    {
+      sk1_pyrowave::i420_to_rgba(
+          y.data(), u.data(), v.data(), width,
+          static_cast<std::uint8_t *>(buffer.bits), dst_stride,
+          copy_width, copy_height, *bt709_lut);
+    }
     const auto convert_end = std::chrono::steady_clock::now();
     const bool posted = ANativeWindow_unlockAndPost(window) == 0;
     const auto post_end = std::chrono::steady_clock::now();
@@ -385,6 +399,12 @@ Java_com_limelight_nvstream_jni_MoonBridge_pyrowaveCreate(JNIEnv *, jclass, jint
     decoder->hdr_mode = hdr_mode;
     decoder->full_range = full_range;
     decoder->bt709_lut = std::make_unique<sk1_pyrowave::Bt709Lut>(full_range != JNI_FALSE);
+#if defined(__arm__) && !defined(__aarch64__)
+    decoder->use_neon = android_getCpuFamily() == ANDROID_CPU_FAMILY_ARM &&
+        (android_getCpuFeatures() & ANDROID_CPU_ARM_FEATURE_NEON) != 0;
+#endif
+    __android_log_print(ANDROID_LOG_INFO, "SK1-PYROWAVE",
+        "CPU staging backend: %s (%dx%d)", decoder->use_neon ? "ARMv7 NEON" : "scalar", width, height);
     const auto luma_size = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
     const auto chroma_size = static_cast<std::size_t>(width / 2) * static_cast<std::size_t>(height / 2);
     decoder->y.resize(luma_size);
