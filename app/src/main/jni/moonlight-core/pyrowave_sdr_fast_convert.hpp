@@ -93,4 +93,13 @@ inline void i420_to_rgba(const std::uint8_t *y, const std::uint8_t *u,
   }
 }
 
+// Implemented in a dedicated armeabi-v7a NEON translation unit.
+#if defined(__arm__) && !defined(__aarch64__)
+void i420_to_rgba_neon(const std::uint8_t *y, const std::uint8_t *u,
+                       const std::uint8_t *v, int width,
+                       std::uint8_t *dst, std::size_t dst_stride,
+                       int copy_width, int copy_height,
+                       bool full_range) noexcept;
+#endif
+
 }  // namespace sk1_pyrowave
