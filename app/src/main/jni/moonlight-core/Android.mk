@@ -66,6 +66,11 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/moonlight-common-c/enet/include \
                     $(LOCAL_PATH)/moonlight-common-c/src \
                     $(AUDIO_HAPTICS_SDK_DIR)/platform/android/src/main/cpp/include
 
+# Build the NEON implementation only for ARMv7; other ABIs use scalar staging.
+ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+LOCAL_SRC_FILES += pyrowave_sdr_neon.cpp.neon
+endif
+
 LOCAL_CFLAGS := -DHAS_SOCKLEN_T=1 -DLC_ANDROID -DHAVE_CLOCK_GETTIME=1
 # The optional PyroWave bridge catches allocation/runtime exceptions before
 # they reach JNI. Keep this enabled for the C++ sources in this module.
