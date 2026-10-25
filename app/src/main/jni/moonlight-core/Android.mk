@@ -76,6 +76,14 @@ LOCAL_CFLAGS := -DHAS_SOCKLEN_T=1 -DLC_ANDROID -DHAVE_CLOCK_GETTIME=1
 # they reach JNI. Keep this enabled for the C++ sources in this module.
 LOCAL_CPPFLAGS += -fexceptions
 
+# AGP's debug build passes NDK_DEBUG=1, which otherwise compiles JNI C++ with
+# -O0. 720p I420 -> RGBA took ~73ms/frame in that configuration on ARMv7.
+# Keep symbols for debugging but optimize the CPU staging hot path.
+# This flag comes after the NDK's default debug optimization flags.
+ifeq ($(TARGET_ARCH_ABI),armeabi-v7a)
+LOCAL_CPPFLAGS += -O3
+endif
+
 ifeq ($(NDK_DEBUG),1)
 LOCAL_CFLAGS += -DLC_DEBUG
 endif
