@@ -98,7 +98,7 @@ public final class TextureBridge {
         Log.i(TAG, "SK1 v14 HEVC direct SurfaceView, low-latency=1, vendor flags cleared: " + format);
         try {
             codec.configure(format, surface, crypto, flags);
-        } catch (IOException | RuntimeException e) {
+        } catch (RuntimeException e) {
             synchronized (TextureBridge.class) {
                 if (hevcCodec == codec) {
                     hevcCodec = null;
