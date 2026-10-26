@@ -40,6 +40,7 @@ import com.limelight.framegen.FramegenPerformanceEnricher
 import com.limelight.framegen.FramegenRuntimeConfig
 import com.limelight.framegen.FramegenRuntimePlanner
 import com.limelight.gamemenu.GameMenu
+import com.limelight.gamemenu.BitrateCardController
 import com.limelight.binding.video.MediaCodecHelper
 import com.limelight.binding.video.PerfOverlayListener
 import com.limelight.binding.video.PerformanceInfo
@@ -70,6 +71,7 @@ import com.limelight.utils.Dialog
 import com.limelight.utils.PanZoomHandler
 import com.limelight.utils.RemoteImeController
 import com.limelight.utils.FullscreenProgressOverlay
+import com.limelight.utils.StreamReconnectBackdrop
 import com.limelight.utils.HdrCapabilityHelper
 import com.limelight.utils.UiHelper
 import com.limelight.utils.AnalyticsManager
@@ -79,6 +81,7 @@ import com.limelight.services.KeyboardAccessibilityEnabler
 import com.limelight.services.KeyboardAccessibilityService
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.app.PictureInPictureParams
 import android.content.ComponentName
 import android.content.Intent
@@ -86,16 +89,21 @@ import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Point
 import android.graphics.Rect
+import android.view.PixelCopy
 import android.hardware.input.InputManager
 import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
+import java.util.concurrent.atomic.AtomicBoolean
 import androidx.preference.PreferenceManager
 import android.util.Rational
 import android.view.Display
@@ -240,6 +248,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         usbForwarding?.let(action)
     }
     private var activeGameMenu: GameMenu? = null
+    private var bitrateCardControllerCache: Pair<NvConnection, BitrateCardController>? = null
     private var crownConfigPicker: CrownConfigPickerDialog? = null
     private var controllerShortcutHintView: View? = null
     private var startHoldWheelView: ComposeView? = null
@@ -315,6 +324,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     private var shouldResumeSession = false
     private var isExtremeResumeEnabled = false
     private var isChangingResolution = false
+    private var displaySettingsCommitted = false
     private var audioRenderer: com.limelight.binding.audio.SmartAudioRenderer? = null
 
     enum class BackKeyMenuMode {
@@ -360,6 +370,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         usbAutoShareSession = UsbAutoShareSession(savedInstanceState?.getStringArrayList("usb_auto_suppressed").orEmpty())
 
         isChangingResolution = false
+        displaySettingsCommitted = savedInstanceState?.getBoolean(STATE_DISPLAY_SETTINGS_COMMITTED, false) == true
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.setDecorFitsSystemWindows(false)
@@ -384,6 +395,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
             PreferenceConfiguration.isExternalDisplayEnabled(this)
         )
         prefConfig = PreferenceConfiguration.readPreferences(this, initialTargetDisplay)
+        val committedDisplaySettings = if (displaySettingsCommitted) DisplayReconnectSettings.capture(prefConfig) else null
         orientationManager = OrientationManager(
             this,
             prefConfig.width,
@@ -409,6 +421,9 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         if (customScreenMode != -1) {
             prefConfig.screenCombinationMode = customScreenMode
         }
+        // Launch overrides are still useful for other per-app settings. Display
+        // choices saved during this session must win when its Activity reconnects.
+        committedDisplaySettings?.applyTo(prefConfig)
         NativeTouchContext.INTIAL_ZONE_PIXELS = prefConfig.longPressflatRegionPixels.toFloat()
         NativeTouchContext.ENABLE_ENHANCED_TOUCH = prefConfig.enableEnhancedTouch
         NativeTouchContext.ENHANCED_TOUCH_ON_RIGHT = if (prefConfig.enhancedTouchOnWhichSide) -1 else 1
@@ -737,6 +752,8 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         computer.name = pcName
         computer.uuid = intent.getStringExtra(EXTRA_PC_UUID)
         progressOverlay?.computer = computer
+        val reconnectBackdrop = StreamReconnectBackdrop.consume()
+        reconnectBackdrop?.let { progressOverlay?.setAppPoster(it) }
         progressOverlay?.show(
             resources.getString(R.string.conn_establishing_title),
             resources.getString(R.string.conn_establishing_msg)
@@ -824,7 +841,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
             connectionContext,
             ComputerDetails.AddressTuple(host, port),
             httpsPort, uniqueId, pairName, config,
-            PlatformBinding.getCryptoProvider(this), serverCert, displayName, forceResumeCurrentSession
+            PlatformBinding.getCryptoProvider(this), serverCert, currentTargetDisplay, displayName, forceResumeCurrentSession
         )
         orientationManager.connection = conn
         controllerHandler = ControllerHandler(
@@ -1791,6 +1808,10 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
 
     override fun onDestroy() {
         destroying = true
+        // 会话真正结束(finish)时丢弃未消费的暂存画面;recreate() 重建不在此列
+        if (isFinishing) {
+            StreamReconnectBackdrop.clear()
+        }
         MoonBridge.detachConnectionListener(this)
         if (::streamView.isInitialized) {
             streamView.setInputCallbacks(null)
@@ -1954,12 +1975,100 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     }
 
     fun changeResolution() {
-        isChangingResolution = true
-        this.recreate()
+        runOnUiThread {
+            if (isChangingResolution) return@runOnUiThread
+            isChangingResolution = true
+            displaySettingsCommitted = true
+            activeGameMenu?.dismiss()
+            activeGameMenu = null
+            if (activeStreamView == null) {
+                recreateAfterResolutionChange()
+            } else {
+                stageReconnectBackdrop(::recreateAfterResolutionChange)
+            }
+        }
+    }
+
+    /** Saves the current stream frame before the surface is destroyed. Failure still rebuilds. */
+    private fun stageReconnectBackdrop(onComplete: () -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            onComplete()
+            return
+        }
+        val view = activeStreamView
+        if (view == null || view.width <= 0 || view.height <= 0 || view.holder.surface?.isValid != true) {
+            onComplete()
+            return
+        }
+        if (!canStageReconnectBackdrop(view.width, view.height)) {
+            onComplete()
+            return
+        }
+        val frame = view.holder.surfaceFrame
+        LimeLog.info(
+            "Reconnect backdrop capture view=${view.width}x${view.height} " +
+                "buffer=${frame.width()}x${frame.height()}"
+        )
+        val bitmap = try {
+            Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+        } catch (_: OutOfMemoryError) {
+            onComplete()
+            return
+        }
+        val completed = AtomicBoolean(false)
+        try {
+            PixelCopy.request(view, bitmap, { result ->
+                if (completed.compareAndSet(false, true)) {
+                    if (result == PixelCopy.SUCCESS && !isFinishing &&
+                        (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR1 || !isDestroyed)
+                    ) {
+                        StreamReconnectBackdrop.stage(bitmap)
+                    } else if (!bitmap.isRecycled) {
+                        bitmap.recycle()
+                    }
+                    onComplete()
+                }
+            }, Handler(Looper.getMainLooper()))
+        } catch (_: Exception) {
+            if (completed.compareAndSet(false, true)) {
+                bitmap.recycle()
+                onComplete()
+            }
+        }
+    }
+
+    private fun recreateAfterResolutionChange() {
+        runOnUiThread {
+            if (!isFinishing &&
+                (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR1 || !isDestroyed)
+            ) {
+                recreate()
+            } else {
+                // 重建被跳过时丢弃暂存画面,避免残留到下一次无关会话的开屏海报
+                StreamReconnectBackdrop.clear()
+            }
+        }
+    }
+
+    /** A full-screen copy needs contiguous memory; low-memory devices keep the app poster. */
+    private fun canStageReconnectBackdrop(width: Int, height: Int): Boolean {
+        val memory = getSystemService(ACTIVITY_SERVICE) as? ActivityManager ?: return false
+        val info = ActivityManager.MemoryInfo()
+        memory.getMemoryInfo(info)
+        val requiredBytes = width.toLong() * height.toLong() * 4L
+        val available = !info.lowMemory && info.availMem > requiredBytes * 2L
+        if (!available) {
+            LimeLog.info(
+                "Reconnect backdrop skipped: lowMemory=${info.lowMemory} " +
+                    "available=${info.availMem} required=${requiredBytes}"
+            )
+        }
+        return available
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putStringArrayList("usb_auto_suppressed", ArrayList(usbAutoShareSession.suppressedGroups))
+        outState.putBoolean(STATE_DISPLAY_SETTINGS_COMMITTED, displaySettingsCommitted)
         super.onSaveInstanceState(outState)
     }
 
@@ -2195,6 +2304,21 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
 
     val relativeTouchContextMap: Array<TouchContext?>
         get() = touchInputHandler.relativeTouchContextMap
+
+    internal val touchpadInputSettings by lazy {
+        com.limelight.binding.input.touch.TouchpadInputSettings(this)
+    }
+
+    fun updateTouchpadSensitivity(percent: Int) {
+        touchpadInputSettings.setSensitivity(percent)
+    }
+
+    fun updateCrownWheelSpeed(speed: Int) {
+        touchpadInputSettings.setWheelSpeed(speed)
+    }
+
+    fun shouldApplyCrownInputProfile(profileId: Long): Boolean =
+        touchpadInputSettings.enterCrownProfile(profileId)
 
     fun setTouchMode(enableRelativeTouch: Boolean) {
         touchInputHandler.setTouchMode(enableRelativeTouch)
@@ -3146,6 +3270,18 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
         updatePipAutoEnter()
     }
 
+    internal fun getBitrateCardController(connection: NvConnection): BitrateCardController {
+        bitrateCardControllerCache?.let { (cachedConnection, controller) ->
+            if (cachedConnection === connection) return controller
+            controller.stop()
+        }
+        return BitrateCardController(
+            this,
+            connection,
+            supportsExtendedBitrate = isPyrowaveSessionActive()
+        ).also { bitrateCardControllerCache = connection to it }
+    }
+
     override fun showGameMenu(device: GameInputDevice?): Boolean {
         return showGameMenuInternal(device, openedFromUsbShortcut = false)
     }
@@ -3492,6 +3628,7 @@ class Game : ThemedComponentActivity(), SurfaceHolder.Callback,
     }
 
     companion object {
+        private const val STATE_DISPLAY_SETTINGS_COMMITTED = "display_settings_committed"
         val REFERENCE_HORIZ_RES = 1280
         val REFERENCE_VERT_RES = 720
 
