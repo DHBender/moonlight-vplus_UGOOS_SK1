@@ -116,7 +116,8 @@ jobs:
           """, encoding="utf-8")
           print("SK1 defaults, update policy and integration notes applied")
           PY
-          git add app/src/main/java/com/limelight/preferences/PreferenceConfiguration.kt app/src/main/java/com/limelight/utils/UpdateManager.kt app/src/main/res/xml/preferences.xml app/build.gradle docs/SK1_VPLUS_12_14_1_BETA2_MERGE.md
+          git add app/src/main/java/com/limelight/preferences/PreferenceConfiguration.kt app/src/main/java/com/limelight/utils/UpdateManager.kt app/src/main/res/xml/preferences.xml app/build.gradle
+git add -f docs/SK1_VPLUS_12_14_1_BETA2_MERGE.md
           git diff --cached --check
           git commit -m "SK1: default to HEVC, disable startup updates, isolate test APK"
           git push origin "HEAD:$GITHUB_REF_NAME"
