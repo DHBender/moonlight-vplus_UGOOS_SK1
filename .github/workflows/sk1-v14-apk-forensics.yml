@@ -74,8 +74,8 @@ jobs:
         with:
           name: sk1-v14-decompiled-hevc-forensics
           path: |
-            /tmp/sk1-jadx/sources/com/limelight/binding/video/TextureBridge.java
-            /tmp/sk1-jadx/sources/com/limelight/binding/video/HevcGeometry.java
+            /tmp/sk1-jadx/sources/com/limelight/sk1/TextureBridge.java
+            /tmp/sk1-jadx/sources/com/limelight/sk1/HevcGeometry.java
             /tmp/sk1-jadx/sources/com/limelight/binding/video/MediaCodecDecoderRenderer.java
             /tmp/sk1-jadx/sources/com/limelight/Game.java
             /tmp/sk1-jadx.log
