@@ -1,0 +1,83 @@
+name: SK1 v14 APK HEVC pipeline forensic
+on:
+  push:
+    branches:
+      - fix/sk1-vplus-beta2-restore-v14-hevc
+    paths:
+      - .github/workflows/sk1-v14-apk-forensics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Download exact tested v14 APK and validate hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 4 --silent --show-error \
+            -o /tmp/working-sk1-v14.apk \
+            https://github.com/DHBender/moonlight-vplus_UGOOS_SK1/releases/download/sk1-texture-v14/Moonlight-SK1-Texture-v14-crop-test-noautoupdate.apk
+          echo 'aea9fb5a6661c90b6dccee462498026eb8310b51e55d9558ae7656020226eedf  /tmp/working-sk1-v14.apk' | sha256sum --check
+          unzip -Z1 /tmp/working-sk1-v14.apk | grep -E 'classes[0-9]*.dex' | head -n 20
+      - name: Install JADX from official release
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 4 -L https://api.github.com/repos/skylot/jadx/releases/latest -o /tmp/jadx-release.json
+          python3 - <<'PY' >/tmp/jadx-url
+          import json
+          j=json.load(open('/tmp/jadx-release.json'))
+          urls=[a['browser_download_url'] for a in j['assets'] if a['name'].startswith('jadx-') and a['name'].endswith('.zip') and 'gui' not in a['name']]
+          if len(urls)!=1: raise SystemExit(f'JADX ZIP candidates: {urls}')
+          print(urls[0])
+          PY
+          curl --fail --location --retry 4 --silent --show-error "$(cat /tmp/jadx-url)" -o /tmp/jadx.zip
+          unzip -q /tmp/jadx.zip -d /tmp/jadx
+          chmod +x /tmp/jadx/bin/jadx
+          /tmp/jadx/bin/jadx --version
+      - name: Recover APK Java/Kotlin bytecode structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sk1-jadx
+          /tmp/jadx/bin/jadx -j 4 --no-res -d /tmp/sk1-jadx /tmp/working-sk1-v14.apk >/tmp/sk1-jadx.log 2>&1 || true
+          tail -n 35 /tmp/sk1-jadx.log
+          echo '==== Relevant decompiled class paths ===='
+          find /tmp/sk1-jadx/sources -iname '*TextureBridge*' -o -iname '*HevcGeometry*' -o -iname '*MediaCodecDecoderRenderer*' -o -iname '*FramePacing*' | head -n 100
+          echo '==== TextureBridge and HEVC geometry source ===='
+          for file in $(find /tmp/sk1-jadx/sources -iname '*TextureBridge.java' -o -iname '*HevcGeometry.java'); do
+            echo "==== BEGIN $file ===="
+            sed -n '1,1200p' "$file"
+            echo "==== END $file ===="
+          done
+          echo '==== Renderer linkage to bridge ===='
+          for file in $(find /tmp/sk1-jadx/sources -iname '*MediaCodecDecoderRenderer.java'); do
+            grep -n -C 7 'TextureBridge' "$file" | head -n 260 || true
+          done
+          echo '==== Game linkage to bridge ===='
+          for file in $(find /tmp/sk1-jadx/sources -path '*/com/limelight/Game.java'); do
+            grep -n -C 9 'TextureBridge' "$file" | head -n 260 || true
+          done
+      - name: Upload focused source analysis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sk1-v14-decompiled-hevc-forensics
+          path: |
+            /tmp/sk1-jadx/sources/com/limelight/binding/video/TextureBridge.java
+            /tmp/sk1-jadx/sources/com/limelight/binding/video/HevcGeometry.java
+            /tmp/sk1-jadx/sources/com/limelight/binding/video/MediaCodecDecoderRenderer.java
+            /tmp/sk1-jadx/sources/com/limelight/Game.java
+            /tmp/sk1-jadx.log
+          if-no-files-found: warn
+          retention-days: 5
