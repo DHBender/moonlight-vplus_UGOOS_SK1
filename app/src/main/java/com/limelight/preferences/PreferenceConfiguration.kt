@@ -116,7 +116,7 @@ class PreferenceConfiguration {
     var pointerVelocityFactor = 0f //Assigned to NativeTouchContext.POINTER_VELOCITY_FACTOR
     var nativeTouchFingersToToggleKeyboard = 0 // Number of fingers to tap to toggle local on-screen keyboard in native touch mode.
 
-    var videoFormat: FormatOption = FormatOption.AUTO
+    var videoFormat: FormatOption = FormatOption.FORCE_HEVC
     internal var decoderInputBufferMode: DecoderInputBufferMode = DecoderInputBufferMode.AUTO
     var deadzonePercentage = 0
     @JvmField var oscOpacity = 0
@@ -1183,7 +1183,7 @@ class PreferenceConfiguration {
 
         private fun getVideoFormatValue(context: Context): FormatOption {
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
-            return when (prefs.getString(VIDEO_FORMAT_PREF_STRING, VIDEO_FORMAT_AUTO)) {
+            return when (prefs.getString(VIDEO_FORMAT_PREF_STRING, VIDEO_FORMAT_HEVC)) {
                 VIDEO_FORMAT_PYROWAVE -> FormatOption.FORCE_PYROWAVE
                 VIDEO_FORMAT_AV1 -> FormatOption.FORCE_AV1
                 VIDEO_FORMAT_HEVC -> FormatOption.FORCE_HEVC

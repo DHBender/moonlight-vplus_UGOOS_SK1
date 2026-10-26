@@ -85,7 +85,7 @@
             android:entries="@array/video_format_names"
             android:entryValues="@array/video_format_values"
             android:summary="@string/summary_video_format"
-            android:defaultValue="auto" />
+            android:defaultValue="forceh265" />
         <ListPreference
             android:key="decoder_input_buffer_mode"
             android:title="@string/title_decoder_input_buffer_mode"

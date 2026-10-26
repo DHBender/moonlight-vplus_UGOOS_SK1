@@ -135,8 +135,10 @@ object UpdateManager {
         }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun checkForUpdatesOnStartup(context: Context) {
-        enqueueUpdateCheck(context, showToast = false, enforceStartupInterval = true)
+        // Ugoos SK1: do not check for app updates on startup.
+        // Manual update checks still require an explicit user action.
     }
 
     /**
