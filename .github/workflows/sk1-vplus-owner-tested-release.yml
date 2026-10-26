@@ -1,0 +1,94 @@
+name: Publish owner-tested SK1 V+ HEVC APK
+
+on:
+  push:
+    branches:
+      - fix/sk1-vplus-beta2-restore-v14-hevc
+    paths:
+      - .github/workflows/sk1-vplus-owner-tested-release.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: sk1-vplus-beta2-hevc-owner-tested-release
+  cancel-in-progress: false
+
+jobs:
+  publish-exact-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN: "40315728798"
+      SOURCE_SHA: "22414c8a4c3cb2b72450adb70d6e9c61c4e93975"
+      APK_SHA256: "c4d8391011d1f5637ecc8f6ae8d8b667ceb7cb59198ea0e12a58b21778b67c5b"
+      ARTIFACT_NAME: "moonlight-sk1-vplus-v14-hevc-restore-experimental"
+      TAG: "sk1-vplus-12.14.1-beta2-hevc-v14-r1"
+      RELEASE_APK: "Moonlight-VPlus-12.14.1-beta2-SK1-HEVC-v14-owner-tested.apk"
+    steps:
+      - name: Verify original successful APK build
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq .head_sha)"
+          conclusion="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq .conclusion)"
+          test "$sha" = "$SOURCE_SHA" || { echo "::error::Wrong source commit: $sha"; exit 1; }
+          test "$conclusion" = "success" || { echo "::error::Original build not successful: $conclusion"; exit 1; }
+          echo "Source build verified: $SOURCE_RUN on $SOURCE_SHA"
+
+      - name: Download exact previously tested APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir release-files
+          test -f release-files/app-nonRoot-debug.apk
+          echo "$APK_SHA256  release-files/app-nonRoot-debug.apk" | sha256sum --check --status || {
+            echo "::error::APK checksum differs from owner-tested artifact"
+            exit 1
+          }
+          mv release-files/app-nonRoot-debug.apk "release-files/$RELEASE_APK"
+          echo "Verified identical APK: $(sha256sum "release-files/$RELEASE_APK")"
+          unzip -tqq "release-files/$RELEASE_APK"
+
+      - name: Publish immutable owner-tested prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release already exists. Refusing to overwrite a tested build."
+            exit 1
+          fi
+          cat > release-notes.md <<'EOF'
+          # Moonlight V+ 12.14.1-beta.2 — Ugoos SK1 HEVC v14
+
+          **Status: owner-tested on the actual Ugoos SK1. Experimental prerelease.**
+
+          This APK is the **exact binary** from GitHub Actions build #40315728798, not a new build or rebuild. The SK1 owner reports exceptionally smooth HEVC game streaming and subjectively very low latency on their real device. Fine image-quality tuning and some visual artifacts remain future work; this release freezes the smoothness/latency baseline.
+
+          ## SK1 modifications
+          - Restored HEVC MediaCodec bridge (direct SurfaceView, low-latency frame presentation).
+          - Added HEVC SPS geometry/crop handling for coded versus visible 4K dimensions.
+          - Integrated video output and frame-pacing release hooks into the newer Moonlight V+.
+          - Default to HEVC; automatic app update checks at startup disabled.
+          - The code is a reconstruction from the owner-tested v14 APK, **not** byte-identical to the original v14 source.
+
+          ## Install
+          - APK: `Moonlight-VPlus-12.14.1-beta2-SK1-HEVC-v14-owner-tested.apk`
+          - Android package: `com.limelight.vplus_sk1merge`.
+          - Original, separately installed working v14 package `com.limelight.vplus_sk1texture` is not affected.
+          - If Android reports `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, uninstall **only** `com.limelight.vplus_sk1merge` before installing. Its settings will be lost.
+
+          ## Provenance
+          - Source commit: `22414c8a4c3cb2b72450adb70d6e9c61c4e93975`
+          - Original successful Actions run: https://github.com/DHBender/moonlight-vplus_UGOOS_SK1/actions/runs/40315728798
+          - APK SHA-256: `c4d8391011d1f5637ecc8f6ae8d8b667ceb7cb59198ea0e12a58b21778b67c5b`
+          - Experimental development PR: https://github.com/DHBender/moonlight-vplus_UGOOS_SK1/pull/4
+
+          **Scope:** real-owner SK1 verification; no independent objective end-to-end latency benchmark or broad-device qualification.
+          EOF
+          gh release create "$TAG" "release-files/$RELEASE_APK"             --repo "$GITHUB_REPOSITORY"             --target "$SOURCE_SHA"             --title "Moonlight V+ 12.14.1-beta.2 — SK1 HEVC v14 (owner-tested)"             --notes-file release-notes.md             --prerelease
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,isPrerelease,assets
