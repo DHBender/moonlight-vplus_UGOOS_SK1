@@ -1,0 +1,158 @@
+name: SK1 V+ beta2 source merge and build
+on:
+  push:
+    branches:
+      - integration/sk1-vplus-12.14.1-beta2-hevc
+    paths:
+      - .github/workflows/sk1-vplus-beta2-merge.yml
+
+permissions:
+  contents: write
+
+jobs:
+  merge-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Checkout SK1 v14 base history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Merge pinned upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add vplus-upstream https://github.com/qiin2333/moonlight-vplus.git
+          git fetch --no-tags vplus-upstream master
+          UPSTREAM_SHA=866cb83690a602c0a416dcbdf7fe5d598d57b661
+          git cat-file -e "$UPSTREAM_SHA^{commit}"
+          if git merge --no-ff --no-commit "$UPSTREAM_SHA"; then
+            echo "Upstream merged without conflicts"
+          else
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ "$conflicts" != "README.md" ]; then
+              printf 'Unexpected merge conflicts:\n%s\n' "$conflicts"
+              exit 1
+            fi
+            git checkout --ours -- README.md
+            git add README.md
+          fi
+          git diff --cached --check
+          git commit -m "Merge Moonlight V+ 12.14.1-beta.2 into SK1 v14 source"
+      - name: Apply SK1 codec and update policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          
+          def replace_exact(path, old, new):
+              p = Path(path)
+              data = p.read_text(encoding="utf-8")
+              count = data.count(old)
+              if count != 1:
+                  raise SystemExit(f"Unexpected source for {path}: expected one match, found {count}: {old[:90]!r}")
+              p.write_text(data.replace(old, new), encoding="utf-8")
+          
+          prefs = "app/src/main/java/com/limelight/preferences/PreferenceConfiguration.kt"
+          replace_exact(prefs, "var videoFormat: FormatOption = FormatOption.AUTO",
+                        "var videoFormat: FormatOption = FormatOption.FORCE_HEVC")
+          replace_exact(prefs, "prefs.getString(VIDEO_FORMAT_PREF_STRING, VIDEO_FORMAT_AUTO)",
+                        "prefs.getString(VIDEO_FORMAT_PREF_STRING, VIDEO_FORMAT_HEVC)")
+          
+          xml = Path("app/src/main/res/xml/preferences.xml")
+          src = xml.read_text(encoding="utf-8")
+          anchor = 'android:key="video_format"'
+          if src.count(anchor) != 1:
+              raise SystemExit("video_format XML preference not unique")
+          start = src.index(anchor)
+          end = src.index("/>", start)
+          element = src[start:end]
+          if element.count('android:defaultValue="auto"') != 1:
+              raise SystemExit("Unexpected XML codec default")
+          src = src[:start] + element.replace('android:defaultValue="auto"',
+                                             'android:defaultValue="forceh265"') + src[end:]
+          xml.write_text(src, encoding="utf-8")
+          
+          update = "app/src/main/java/com/limelight/utils/UpdateManager.kt"
+          replace_exact(update,
+                        "    fun checkForUpdatesOnStartup(context: Context) {\n"
+                        "        enqueueUpdateCheck(context, showToast = false, enforceStartupInterval = true)\n"
+                        "    }",
+                        '    @Suppress("UNUSED_PARAMETER")\n'
+                        '    fun checkForUpdatesOnStartup(context: Context) {\n'
+                        '        // Ugoos SK1: do not check for app updates on startup.\n'
+                        '        // Manual update checks still require an explicit user action.\n'
+                        '    }')
+          
+          gradle = "app/build.gradle"
+          replace_exact(gradle, 'versionName "12.14.1-beta.2"',
+                        'versionName "12.14.1-beta.2-sk1merge"')
+          replace_exact(gradle, 'applicationIdSuffix ".vplus_debug"',
+                        'applicationIdSuffix ".vplus_sk1merge"')
+          
+          docs = Path("docs/SK1_VPLUS_12_14_1_BETA2_MERGE.md")
+          docs.write_text("""# Ugoos SK1 / Moonlight V+ 12.14.1-beta.2 integration
+          
+          - Base: release/sk1-texture-v14 at 4948db01a13fbc6605fb10b92235284c204693b2.
+          - Upstream: qiin2333/moonlight-vplus at 866cb83690a602c0a416dcbdf7fe5d598d57b661.
+          - Upstream changes merged, retaining fork README.md on the sole merge conflict.
+          - New installations default to HEVC (forceh265) in XML and Kotlin defaults.
+          - Automatic application update checks on startup are disabled in UpdateManager.
+            Manual update-check action is intentionally left available.
+          - Debug package: com.limelight.vplus_sk1merge, installed alongside tested v14.
+          - HEVC smoothness is NOT verified by this merge: the released v14 APK was
+            uploaded separately, and the v14 Git branch does not contain codec-renderer
+            modifications relative to upstream 12.13.3. A source-identical reconstruction
+            of that APK has not been established.
+          - Owner-tested v14 APK and release branch are not modified.
+          - Verify on the physical Ugoos SK1 before promoting this integration.
+          
+          Validation: automated build/unit tests where dependencies permit, followed by
+          on-device HEVC 4K HDR, pacing, crop and input-latency comparison against v14.
+          """, encoding="utf-8")
+          print("SK1 defaults, update policy and integration notes applied")
+          PY
+          git add app/src/main/java/com/limelight/preferences/PreferenceConfiguration.kt app/src/main/java/com/limelight/utils/UpdateManager.kt app/src/main/res/xml/preferences.xml app/build.gradle docs/SK1_VPLUS_12_14_1_BETA2_MERGE.md
+          git diff --cached --check
+          git commit -m "SK1: default to HEVC, disable startup updates, isolate test APK"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+          echo "Integration branch pushed: $(git rev-parse HEAD)"
+      - name: Synchronize recursive submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+      - name: Checkout audio haptics SDK
+        uses: actions/checkout@v4
+        with:
+          repository: AlkaidLab/moonlight-audio-haptics
+          ref: b3f97c3bb7500ea7b1985aea568e5c7b40308d3b
+          path: .deps/moonlight-audio-haptics
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1
+      - name: Build and test non-root debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AUDIO_HAPTICS_SDK_DIR="$GITHUB_WORKSPACE/.deps/moonlight-audio-haptics"
+          chmod +x gradlew
+          rm -f local.properties
+          ./gradlew :app:testNonRootDebugUnitTest :app:assembleNonRootDebug --no-daemon --stacktrace
+      - name: Upload side-by-side test APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonlight-sk1-vplus-12.14.1-beta2-hevc
+          path: app/build/outputs/apk/nonRoot/debug/*.apk
+          if-no-files-found: warn
