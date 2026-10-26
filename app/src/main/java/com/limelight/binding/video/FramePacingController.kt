@@ -9,6 +9,7 @@ import android.os.HandlerThread
 import android.os.Process
 import android.util.SparseLongArray
 import android.view.Choreographer
+import com.limelight.sk1.TextureBridge
 import com.limelight.BuildConfig
 import com.limelight.LimeLog
 import com.limelight.preferences.PreferenceConfiguration
@@ -147,7 +148,7 @@ internal class FramePacingController(
             try {
                 takeHostTarget(dropped)
                 if (dropped >= 0) {
-                    videoDecoder?.releaseOutputBuffer(dropped, false)
+                    videoDecoder?.let { TextureBridge.releaseBoolean(it, dropped, false) }
                 }
             } catch (_: IllegalStateException) {
                 // Buffer index may be stale after codec recovery
@@ -166,7 +167,7 @@ internal class FramePacingController(
         if (!outputBufferQueue.offer(bufferIndex)) {
             takeHostTarget(bufferIndex)
             try {
-                videoDecoder?.releaseOutputBuffer(bufferIndex, false)
+                videoDecoder?.let { TextureBridge.releaseBoolean(it, bufferIndex, false) }
             } catch (_: IllegalStateException) {
                 // Buffer index may be stale after codec recovery
             }
@@ -216,13 +217,13 @@ internal class FramePacingController(
                     adjustedTime -= 500_000_000L / refreshRate
                 }
                 try {
-                    videoDecoder?.releaseOutputBuffer(nextOutputBuffer, adjustedTime)
+                    videoDecoder?.let { TextureBridge.releaseTimed(it, nextOutputBuffer, adjustedTime) }
                     lastRenderedFrameTimeNanos = adjustedTime
                     JitterMonitor.recordPresent(adjustedTime)
                     callbacks.onFrameRendered()
                 } catch (_: IllegalStateException) {
                     try {
-                        videoDecoder?.releaseOutputBuffer(nextOutputBuffer, false)
+                        videoDecoder?.let { TextureBridge.releaseBoolean(it, nextOutputBuffer, false) }
                     } catch (e: IllegalStateException) {
                         e.printStackTrace()
                         callbacks.onDecoderException(e)
@@ -357,7 +358,7 @@ internal class FramePacingController(
                 } else {
                     calculatePresentationTime(currentTime, vsyncOffsetNs, presentationDeadlineNs)
                 }
-            videoDecoder?.releaseOutputBuffer(nextOutputBuffer, presentationTimeNs)
+            videoDecoder?.let { TextureBridge.releaseTimed(it, nextOutputBuffer, presentationTimeNs) }
             if (presentStats != null || JitterMonitor.enabled) {
                 // presentationTimeNs==0 表示立即呈现 → 用 currentTime snap 近似 SurfaceFlinger 落点
                 val effectivePresentNs = if (presentationTimeNs > 0) presentationTimeNs
