@@ -24,6 +24,7 @@ import com.limelight.nvstream.ColorRangePolicy
 import com.limelight.nvstream.av.video.VideoDecoderRenderer
 import com.limelight.nvstream.jni.MoonBridge
 import com.limelight.preferences.PreferenceConfiguration
+import com.limelight.sk1.TextureBridge
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -44,6 +45,9 @@ class MediaCodecDecoderRenderer(
     private val perfListener: PerfOverlayListener,
     private val pyrowaveFailureListener: (String) -> Unit,
 ) : VideoDecoderRenderer() {
+
+    // This dedicated SK1 diagnostic package reconstructs the owner-tested v14 HEVC path.
+    init { TextureBridge.attach(activity) }
 
     companion object {
         private const val USE_FRAME_RENDER_TIME = true
@@ -1093,7 +1097,7 @@ class MediaCodecDecoderRenderer(
             pendingFramegenSurface ?: directOutputSurface()
         }
         try {
-            videoDecoder!!.configure(format, outSurface, null, 0)
+            TextureBridge.configure(videoDecoder!!, format, outSurface, null, 0)
         } catch (e: IllegalArgumentException) {
             // Keep growth rejection out of recovery's invalid-surface handlers. The state-error
             // path tries reset/recreation and all configuration candidates before reporting failure.
@@ -1178,7 +1182,7 @@ class MediaCodecDecoderRenderer(
             }
         } finally {
             if (!configured && videoDecoder != null) {
-                videoDecoder!!.release()
+                TextureBridge.releaseCodec(videoDecoder!!)
                 videoDecoder = null
             }
         }
@@ -1680,7 +1684,7 @@ class MediaCodecDecoderRenderer(
                                 "Trying to recreate decoder after CodecException"
                             }
                         )
-                        videoDecoder!!.release()
+                        TextureBridge.releaseCodec(videoDecoder!!)
 
                         try {
                             val err = initializeDecoder(true)
@@ -1879,12 +1883,12 @@ class MediaCodecDecoderRenderer(
                         // 偏平滑档(MAX_SMOOTHNESS/CAP_FPS)权衡少量缓冲延迟换取无判抖，语义相符。
                         val fps = if (refreshRate > 0) refreshRate else 60
                         val frameIntervalNs = 1_000_000_000L / fps
-                        videoDecoder!!.releaseOutputBuffer(bufferIndex, hostCadenceClock.presentTimeNs(hostPtsUs, frameIntervalNs))
+                        TextureBridge.releaseTimed(videoDecoder!!, bufferIndex, hostCadenceClock.presentTimeNs(hostPtsUs, frameIntervalNs))
                     } else {
-                        videoDecoder!!.releaseOutputBuffer(bufferIndex, 0)
+                        TextureBridge.releaseTimed(videoDecoder!!, bufferIndex, 0)
                     }
                 } else {
-                    videoDecoder!!.releaseOutputBuffer(bufferIndex, System.nanoTime())
+                    TextureBridge.releaseTimed(videoDecoder!!, bufferIndex, System.nanoTime())
                 }
                 activeWindowVideoStats.totalFramesRendered++
                 frameIntervalTracker.recordFrame()
@@ -1923,6 +1927,7 @@ class MediaCodecDecoderRenderer(
             override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: BufferInfo) {
                 if (stopping) return
 
+                TextureBridge.noteOutput(codec, index, info)
                 numFramesOut++
                 hdr10PlusOutputObserver.observeOutput(codec, index, info.presentationTimeUs)
 
@@ -1955,6 +1960,7 @@ class MediaCodecDecoderRenderer(
 
             override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
                 handleOutputFormatChanged(format, "async")
+                TextureBridge.noteOutputFormat(codec, format)
             }
         }, codecCallbackHandler)
     }
@@ -1975,7 +1981,7 @@ class MediaCodecDecoderRenderer(
                 while (!stopping) {
                     try {
                         // Try to output a frame
-                        var outIndex = videoDecoder!!.dequeueOutputBuffer(info, 50000)
+                        var outIndex = TextureBridge.dequeueOutput(videoDecoder!!, info, 50000)
                         if (outIndex >= 0) {
                             hdr10PlusOutputObserver.observeOutput(videoDecoder!!, outIndex, info.presentationTimeUs)
                             var presentationTimeUs = info.presentationTimeUs
@@ -1989,9 +1995,9 @@ class MediaCodecDecoderRenderer(
                                 prefs.framePacing != PreferenceConfiguration.FRAME_PACING_PRECISE_SYNC
                             ) {
                                 // Get the last output buffer in the queue
-                                while (videoDecoder!!.dequeueOutputBuffer(info, 0).also { outIndex = it } >= 0) {
+                                while (TextureBridge.dequeueOutput(videoDecoder!!, info, 0).also { outIndex = it } >= 0) {
                                     hdr10PlusOutputObserver.observeOutput(videoDecoder!!, outIndex, info.presentationTimeUs)
-                                    videoDecoder!!.releaseOutputBuffer(lastIndex, false)
+                                    TextureBridge.releaseBoolean(videoDecoder!!, lastIndex, false)
 
                                     numFramesOut++
 
@@ -2004,11 +2010,11 @@ class MediaCodecDecoderRenderer(
                                 ) {
                                     // In max smoothness or cap FPS mode, we want to never drop frames
                                     // Use a PTS that will cause this frame to never be dropped
-                                    videoDecoder!!.releaseOutputBuffer(lastIndex, 0)
+                                    TextureBridge.releaseTimed(videoDecoder!!, lastIndex, 0)
                                 } else {
                                     // Use a PTS that will cause this frame to be dropped if another comes in within
                                     // the same V-sync period
-                                    videoDecoder!!.releaseOutputBuffer(lastIndex, System.nanoTime())
+                                    TextureBridge.releaseTimed(videoDecoder!!, lastIndex, System.nanoTime())
                                 }
 
                                 activeWindowVideoStats.totalFramesRendered++
@@ -2032,6 +2038,7 @@ class MediaCodecDecoderRenderer(
                             when (outIndex) {
                                 MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                                     handleOutputFormatChanged(videoDecoder!!.outputFormat, "sync")
+                                    TextureBridge.noteOutputFormat(videoDecoder!!, videoDecoder!!.outputFormat)
                                 }
                                 MediaCodec.INFO_TRY_AGAIN_LATER -> {}
                                 else -> {}
@@ -2083,7 +2090,7 @@ class MediaCodecDecoderRenderer(
             } else {
                 // Sync mode: poll the decoder directly
                 while (nextInputBufferIndex < 0 && !stopping) {
-                    nextInputBufferIndex = decoder.dequeueInputBuffer(5000)
+                    nextInputBufferIndex = TextureBridge.dequeueInput(decoder, 5000)
                 }
             }
 
@@ -2206,7 +2213,7 @@ class MediaCodecDecoderRenderer(
         dolbyVisionRoutingActive = false
         if (videoDecoder != null) {
             try {
-                videoDecoder!!.release()
+                TextureBridge.releaseCodec(videoDecoder!!)
             } catch (e: Exception) {
                 // Ignore exceptions during shutdown
                 LimeLog.warning("Exception during decoder release: " + e.message)
@@ -2464,13 +2471,13 @@ class MediaCodecDecoderRenderer(
                     LimeLog.warning("LinearBlock failed, falling back: " + e.message)
                     linearBlockEnabled = false
                     nextInputBuffer!!.flip()
-                    decoder.queueInputBuffer(
+                    TextureBridge.queueInput(decoder, 
                         nextInputBufferIndex,
                         0, nextInputBuffer!!.limit(), timestampUs, codecFlags
                     )
                 }
             } else {
-                decoder.queueInputBuffer(
+                TextureBridge.queueInput(decoder, 
                     nextInputBufferIndex,
                     0, nextInputBuffer!!.position(),
                     timestampUs, codecFlags
@@ -2598,6 +2605,7 @@ class MediaCodecDecoderRenderer(
         receiveTimeUs: Long, enqueueTimeUs: Long, hostPresentationTimeUs: Long,
         frameMetadata: ByteArray?,
     ): Int {
+        TextureBridge.beginSubmit()
         if (stopping || isProcessingPaused) {
             // Don't bother if we're stopping or paused
             return MoonBridge.DR_OK
