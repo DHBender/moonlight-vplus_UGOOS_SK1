@@ -36,7 +36,7 @@ jobs:
           test "$(git rev-parse refs/remotes/sk1-upstream/v12.14.3)" = "646bc95aeea8dc78327042a537d7f7a82f14af5f"
           cp app/src/main/java/com/limelight/sk1/TextureBridge.java /tmp/sk1-texture.java
           cp app/src/main/java/com/limelight/sk1/HevcGeometry.java /tmp/sk1-geometry.java
-          git restore --source=refs/remotes/sk1-upstream/v12.14.3 --staged --worktree -- . ':(exclude).github' ':(exclude)docs'
+          git restore --source=refs/remotes/sk1-upstream/v12.14.3 --staged --worktree -- . ':(exclude).github' ':(exclude)docs' ':(exclude)README.md'
           mkdir -p app/src/main/java/com/limelight/sk1
           cp /tmp/sk1-texture.java app/src/main/java/com/limelight/sk1/TextureBridge.java
           cp /tmp/sk1-geometry.java app/src/main/java/com/limelight/sk1/HevcGeometry.java
