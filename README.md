@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> **Ugoos SK1 custom Moonlight V+ HEVC releases:** The proven owner-tested baseline is [12.14.1-beta.2 + SK1 HEVC v14](https://github.com/DHBender/moonlight-vplus_UGOOS_SK1/releases/tag/sk1-vplus-12.14.1-beta2-hevc-v14-r1). The [12.14.3 experimental update](https://github.com/DHBender/moonlight-vplus_UGOOS_SK1/releases/tag/sk1-vplus-12.14.3-hevc-v14-exp1) retains the same reconstructed SK1 direct HEVC bridge but **has not yet been owner-tested on hardware**. Original SK1 Texture v14 is separately preserved. Source reconstruction is not a byte-for-byte decompilation. AV1 is not fixed by this update.
+>
+> [SK1 integration and verification notes](docs/SK1_VPLUS_12_14_3_EXPERIMENT.md)
+
+---
+
 <div align="center">
   <img src="./app/src/main/res/drawable/vplus.webp" width="100" alt="Moonlight V+ Logo">
 
