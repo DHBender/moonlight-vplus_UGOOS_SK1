@@ -1,0 +1,123 @@
+name: SK1 V+ 12.14.3 build and prerelease
+on:
+  push:
+    branches:
+      - integration/sk1-vplus-12.14.3-hevc-v14
+    paths:
+      - .github/workflows/sk1-vplus-12.14.3-release.yml
+      - .github/scripts/sk1-merge-vplus-12.14.3.py
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sk1-vplus-143-test
+  cancel-in-progress: false
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      TAG: sk1-vplus-12.14.3-hevc-v14-exp1
+      APK_NAME: Moonlight-VPlus-12.14.3-SK1-HEVC-v14-experimental.apk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: true
+      - name: Fetch upstream 12.14.3 and reapply exact SK1 HEVC hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add sk1-upstream https://github.com/qiin2333/moonlight-vplus.git
+          git fetch sk1-upstream refs/tags/v12.14.3:refs/remotes/sk1-upstream/v12.14.3
+          test "$(git rev-parse refs/remotes/sk1-upstream/v12.14.3)" = "646bc95aeea8dc78327042a537d7f7a82f14af5f"
+          cp app/src/main/java/com/limelight/sk1/TextureBridge.java /tmp/sk1-texture.java
+          cp app/src/main/java/com/limelight/sk1/HevcGeometry.java /tmp/sk1-geometry.java
+          git restore --source=refs/remotes/sk1-upstream/v12.14.3 --staged --worktree -- . ':(exclude).github' ':(exclude)docs'
+          mkdir -p app/src/main/java/com/limelight/sk1
+          cp /tmp/sk1-texture.java app/src/main/java/com/limelight/sk1/TextureBridge.java
+          cp /tmp/sk1-geometry.java app/src/main/java/com/limelight/sk1/HevcGeometry.java
+          UPSTREAM_REF=refs/remotes/sk1-upstream/v12.14.3 python3 .github/scripts/sk1-merge-vplus-12.14.3.py
+          git add -A
+          git diff --cached --check
+          git commit -m "SK1: integrate pinned upstream V+ 12.14.3 and validated HEVC bridge"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+          echo "SK1_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Synchronize native submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+      - name: Checkout pinned audio-haptics SDK
+        uses: actions/checkout@v4
+        with:
+          repository: AlkaidLab/moonlight-audio-haptics
+          ref: b3f97c3bb7500ea7b1985aea568e5c7b40308d3b
+          path: .deps/moonlight-audio-haptics
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1
+      - name: Verify HEVC bridge and fresh upstream features
+        run: |
+          set -euo pipefail
+          grep -q 'TextureBridge.configure' app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.kt
+          grep -q 'recordResolutionOutput' app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.kt
+          grep -q 'TextureBridge.releaseTimed' app/src/main/java/com/limelight/binding/video/FramePacingController.kt
+          grep -q 'ResolutionSwitchController' app/src/main/java/com/limelight/Game.kt
+          grep -q 'vplus_sk1merge143' app/build.gradle
+      - name: Test and assemble experimental APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AUDIO_HAPTICS_SDK_DIR="$GITHUB_WORKSPACE/.deps/moonlight-audio-haptics"
+          rm -f local.properties
+          chmod +x gradlew
+          ./gradlew :app:testNonRootDebugUnitTest :app:assembleNonRootDebug --no-daemon --stacktrace
+          test -f app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
+          unzip -tqq app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
+          mkdir -p release-files
+          cp app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk "release-files/$APK_NAME"
+          sha256sum "release-files/$APK_NAME" | tee release-files/SHA256SUMS.txt
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sk1-vplus-12.14.3-hevc-exp1
+          path: release-files/
+          if-no-files-found: warn
+      - name: Publish experimental GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<'EOF'
+          # Moonlight V+ 12.14.3 + SK1 HEVC v14 — experiment 1
+
+          Combines pinned upstream V+ 12.14.3 with reconstructed, owner-tested
+          SK1 v14 low-latency HEVC MediaCodec bridge. Retains upstream resolution
+          hot-switch, decoder recovery, DualSense and stability changes.
+
+          HEVC remains the default. No automatic application update check.
+          Separate package: com.limelight.vplus_sk1merge143.
+          Prior working SK1 APKs are not replaced.
+
+          This new combination still requires physical Ugoos SK1 4K60 HDR validation.
+          AV1 breakup/stutter not addressed in this build. The previously perceived
+          HEVC artifacts were traced to game motion-blur settings.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists; do not overwrite."
+            exit 1
+          fi
+          gh release create "$TAG" "release-files/$APK_NAME" "release-files/SHA256SUMS.txt" \
+            --target "$SK1_SOURCE_SHA" \
+            --title "Moonlight V+ 12.14.3 — SK1 HEVC v14 (experimental)" \
+            --notes-file release-notes.md --prerelease
