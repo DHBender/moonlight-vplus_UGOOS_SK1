@@ -6,16 +6,16 @@ import com.limelight.nvstream.HostGamepadSelection
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.graphics.Point
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Build
 import android.view.Display
 import android.view.KeyEvent
-import android.view.WindowManager
 import androidx.preference.PreferenceManager
 import com.limelight.binding.input.MouseAxisCorrection
+import com.limelight.binding.input.InputDeviceSensorPolicy
 import com.limelight.binding.input.haptics.GameRumbleMode
+import com.limelight.binding.input.haptics.Ds5SimulationMode
 import com.limelight.binding.video.DecoderInputBufferMode
 import com.limelight.nvstream.jni.MoonBridge
 import kotlin.math.max
@@ -131,6 +131,8 @@ class PreferenceConfiguration {
     var usbDriver = false
     var allowExperimentalHaptics = false
     var hostGamepadSelection = HostGamepadSelection.AUTOMATIC
+    var ds5SimulationMode = Ds5SimulationMode.LEGACY
+    var nativeDeviceHaptics = false
     var dualSenseWirelessBridge = false
     var dualSenseDirectBluetooth = false
     @JvmField var flipFaceButtons = false
@@ -339,7 +341,6 @@ class PreferenceConfiguration {
                 .putBoolean(SHOW_DISPLAY_SETTINGS_CARD_PREF_STRING, showDisplaySettingsCard)
                 .putBoolean(SHOW_AUDIO_HAPTICS_CARD_PREF_STRING, showAudioHapticsCard)
                 .putBoolean(SHOW_GYRO_CARD_PREF_STRING, showGyroCard)
-                .putBoolean(SHOW_QuickKeyCard, showQuickKeyCard)
                 .putBoolean(SHOW_WAVEFORM_HAPTICS_CARD_PREF_STRING, showWaveformHapticsCard)
                 .putBoolean(AUDIO_VIBRATION_ENABLE_PREF_STRING, enableAudioVibration)
                 .putInt(AUDIO_VIBRATION_STRENGTH_PREF_STRING, audioVibrationStrength)
@@ -419,6 +420,15 @@ class PreferenceConfiguration {
             e.printStackTrace()
             false
         }
+    }
+
+    /** Save an explicit visibility change; unrelated saves must leave the orientation default unset. */
+    fun setQuickKeyCardVisibility(context: Context, visible: Boolean) {
+        if (showQuickKeyCard == visible) return
+        showQuickKeyCard = visible
+        PreferenceManager.getDefaultSharedPreferences(context).edit()
+            .putBoolean(SHOW_QuickKeyCard, visible)
+            .apply()
     }
 
     /**
@@ -709,6 +719,10 @@ class PreferenceConfiguration {
         internal const val FULL_RANGE_PREF_STRING = "checkbox_full_range"
         private const val GAMEPAD_TOUCHPAD_AS_MOUSE_PREF_STRING = "checkbox_gamepad_touchpad_as_mouse"
         private const val GAMEPAD_MOTION_SENSORS_PREF_STRING = "checkbox_gamepad_motion_sensors"
+        private const val GAMEPAD_MOTION_SENSORS_ANDROID12_MIGRATION_PREF_STRING =
+            "gamepad_motion_sensors_android12_opt_in_migrated"
+        internal const val GAMEPAD_MOTION_SENSORS_ANDROID12_CONFIRMED_PREF_STRING =
+            "gamepad_motion_sensors_android12_opt_in_confirmed"
         private const val GAMEPAD_MOTION_FALLBACK_PREF_STRING = "checkbox_gamepad_motion_fallback"
 
         // 陀螺仪偏好设置
@@ -919,7 +933,6 @@ class PreferenceConfiguration {
         private const val DEFAULT_REDUCE_REFRESH_RATE = false
         private const val DEFAULT_FULL_RANGE = false
         private const val DEFAULT_GAMEPAD_TOUCHPAD_AS_MOUSE = false
-        private const val DEFAULT_GAMEPAD_MOTION_SENSORS = true
         private const val DEFAULT_GAMEPAD_MOTION_FALLBACK = false
 
         // 陀螺仪偏好默认值
@@ -1183,7 +1196,7 @@ class PreferenceConfiguration {
 
         private fun getVideoFormatValue(context: Context): FormatOption {
             val prefs = PreferenceManager.getDefaultSharedPreferences(context)
-            return when (prefs.getString(VIDEO_FORMAT_PREF_STRING, VIDEO_FORMAT_HEVC)) {
+            return when (prefs.getString(VIDEO_FORMAT_PREF_STRING, VIDEO_FORMAT_AUTO)) {
                 VIDEO_FORMAT_PYROWAVE -> FormatOption.FORCE_PYROWAVE
                 VIDEO_FORMAT_AV1 -> FormatOption.FORCE_AV1
                 VIDEO_FORMAT_HEVC -> FormatOption.FORCE_HEVC
@@ -1352,19 +1365,11 @@ class PreferenceConfiguration {
             config.isCustomResolution =
                 resStr != RES_NATIVE && !RESOLUTIONS.contains(resStr)
 
-            // 添加Native分辨率支持
             if (resStr == RES_NATIVE) {
-                // 获取设备原生分辨率
-                val display = nativeDisplay
-                    ?: (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay
-                val size = Point()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
-                    display.getRealSize(size) // 需要API 17+
-                } else {
-                    display.getSize(size) // 兼容旧版本
-                }
-                config.width = size.x
-                config.height = size.y
+                // Match the menu's landscape Native base; reverseResolution is applied below.
+                val size = DisplayChoiceLists.nativeSize(context, nativeDisplay)
+                config.width = size?.first ?: getWidthFromResolutionString(DEFAULT_RESOLUTION)
+                config.height = size?.second ?: getHeightFromResolutionString(DEFAULT_RESOLUTION)
             } else {
                 // 原有解析逻辑
                 config.width = getWidthFromResolutionString(resStr)
@@ -1392,13 +1397,30 @@ class PreferenceConfiguration {
                 prefs.edit().putBoolean(SMALL_ICONS_PREF_STRING, getDefaultSmallMode(context)).apply()
             }
 
-            if (!prefs.contains(GAMEPAD_MOTION_SENSORS_PREF_STRING) && Build.VERSION.SDK_INT == Build.VERSION_CODES.S) {
-                // Android 12 has a nasty bug that causes crashes when the app touches the InputDevice's
-                // associated InputDeviceSensorManager (just calling getSensorManager() is enough).
-                // As a workaround, we will override the default value for the gamepad motion sensor
-                // option to disabled on Android 12 to reduce the impact of this bug.
-                // https://cs.android.com/android/_/android/platform/frameworks/base/+/8970010a5e9f3dc5c069f56b4147552accfcbbeb
-                prefs.edit().putBoolean(GAMEPAD_MOTION_SENSORS_PREF_STRING, false).apply()
+            if (InputDeviceSensorPolicy.isSupported(Build.VERSION.SDK_INT) &&
+                !InputDeviceSensorPolicy.isStable(Build.VERSION.SDK_INT)
+            ) {
+                val migrationComplete = prefs.getBoolean(
+                    GAMEPAD_MOTION_SENSORS_ANDROID12_MIGRATION_PREF_STRING,
+                    false
+                )
+                val confirmedInApp = prefs.getBoolean(
+                    GAMEPAD_MOTION_SENSORS_ANDROID12_CONFIRMED_PREF_STRING,
+                    false
+                )
+                if (!migrationComplete ||
+                    (prefs.getBoolean(GAMEPAD_MOTION_SENSORS_PREF_STRING, false) && !confirmedInApp)
+                ) {
+                    // Android 12/12L has a framework hotplug crash in InputDeviceSensorManager.
+                    // Keep the opt-in visible, but default it off until the user confirms it in-app.
+                    // The confirmation marker is device-local, so a restored portable preference
+                    // cannot enable the risky path by itself.
+                    // https://cs.android.com/android/_/android/platform/frameworks/base/+/8970010a5e9f3dc5c069f56b4147552accfcbbeb
+                    prefs.edit()
+                        .putBoolean(GAMEPAD_MOTION_SENSORS_PREF_STRING, false)
+                        .putBoolean(GAMEPAD_MOTION_SENSORS_ANDROID12_MIGRATION_PREF_STRING, true)
+                        .apply()
+                }
             }
 
             // This must happen after the preferences migration to ensure the preferences are populated
@@ -1512,6 +1534,9 @@ class PreferenceConfiguration {
             config.combineJoyCons = prefs.getBoolean("checkbox_combine_joycons", true)
             config.usbDriver = prefs.getBoolean(USB_DRIVER_PREF_SRING, DEFAULT_USB_DRIVER)
             config.allowExperimentalHaptics = prefs.getBoolean("checkbox_experimental_haptic_protocols", false)
+            config.ds5SimulationMode = Ds5SimulationMode.fromPreference(
+                prefs.getString("list_ds5_simulation_mode", "legacy"))
+            config.nativeDeviceHaptics = prefs.getBoolean("checkbox_native_device_haptics", false)
             config.hostGamepadSelection = HostGamepadSelection.fromPreference(
                 prefs.getString("list_host_gamepad_selection", "automatic"))
             config.dualSenseWirelessBridge = prefs.getBoolean(
@@ -1644,7 +1669,10 @@ class PreferenceConfiguration {
             config.reduceRefreshRate = prefs.getBoolean(REDUCE_REFRESH_RATE_PREF_STRING, DEFAULT_REDUCE_REFRESH_RATE)
             config.fullRange = prefs.getBoolean(FULL_RANGE_PREF_STRING, DEFAULT_FULL_RANGE)
             config.gamepadTouchpadAsMouse = prefs.getBoolean(GAMEPAD_TOUCHPAD_AS_MOUSE_PREF_STRING, DEFAULT_GAMEPAD_TOUCHPAD_AS_MOUSE)
-            config.gamepadMotionSensors = prefs.getBoolean(GAMEPAD_MOTION_SENSORS_PREF_STRING, DEFAULT_GAMEPAD_MOTION_SENSORS)
+            config.gamepadMotionSensors = prefs.getBoolean(
+                GAMEPAD_MOTION_SENSORS_PREF_STRING,
+                InputDeviceSensorPolicy.defaultEnabled(Build.VERSION.SDK_INT)
+            )
             config.gamepadMotionSensorsFallbackToDevice = prefs.getBoolean(GAMEPAD_MOTION_FALLBACK_PREF_STRING, DEFAULT_GAMEPAD_MOTION_FALLBACK)
             config.enableSimplifyPerfOverlay = false
 
@@ -1666,9 +1694,6 @@ class PreferenceConfiguration {
                 config.enableAudioVibration
             )
             config.showGyroCard = prefs.getBoolean(SHOW_GYRO_CARD_PREF_STRING, true)
-            // 横屏时快捷卡片默认不开启
-            val defaultQuickKeyCard = config.width <= config.height
-            config.showQuickKeyCard = prefs.getBoolean(SHOW_QuickKeyCard, defaultQuickKeyCard)
             // Preserve the historical capability-driven behavior for existing installs.
             config.showWaveformHapticsCard = prefs.getBoolean(
                 SHOW_WAVEFORM_HAPTICS_CARD_PREF_STRING,
@@ -1734,6 +1759,10 @@ class PreferenceConfiguration {
                 config.width = config.height
                 config.height = temp
             }
+
+            // Default to visible for the final portrait dimensions; preserve an explicit choice.
+            val defaultQuickKeyCard = config.width <= config.height
+            config.showQuickKeyCard = prefs.getBoolean(SHOW_QuickKeyCard, defaultQuickKeyCard)
 
             // 读取画面位置设置
             val posString = prefs.getString(SCREEN_POSITION_PREF_STRING, DEFAULT_SCREEN_POSITION) ?: DEFAULT_SCREEN_POSITION

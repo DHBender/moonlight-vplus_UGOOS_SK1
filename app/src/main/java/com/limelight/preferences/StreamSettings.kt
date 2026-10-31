@@ -98,6 +98,9 @@ import com.limelight.binding.audio.MicrophoneButtonPositionStore
 import com.limelight.ui.FloatBallPositionStore
 import com.limelight.ui.FloatBallPreferences
 import com.limelight.binding.input.haptics.GameRumbleMode
+import com.limelight.binding.input.haptics.Ds5SimulationMode
+import com.limelight.binding.input.haptics.NativeAuthoredHaptics
+import com.limelight.nvstream.HostGamepadSelection
 import com.limelight.binding.video.MediaCodecHelper
 import com.limelight.handbook.HandbookLauncher
 import com.limelight.utils.AboutDialogLauncher
@@ -114,8 +117,10 @@ import com.limelight.utils.UpdateManager
 import com.limelight.utils.background.PipwImages
 import com.limelight.utils.background.PipwImageStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 import jp.wasabeef.glide.transformations.BlurTransformation
 import jp.wasabeef.glide.transformations.ColorFilterTransformation
@@ -1538,6 +1543,16 @@ class StreamSettings : ThemedAppCompatActivity() {
                     view.paddingRight, view.paddingBottom)
             UiHelper.applyStatusBarPadding(view)
             return view
+        }
+
+        override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+            super.onViewCreated(view, savedInstanceState)
+            // MediaCodecList 枚举走 mediaserver binder IPC,放到 IO 线程探测;
+            // 绑定视图生命周期,设置页视图销毁时协程自动取消。
+            viewLifecycleOwner.lifecycleScope.launch {
+                val hasMtk = withContext(Dispatchers.IO) { MediaCodecHelper.hasMediaTekDecoder() }
+                updateRuntimeVisibility(findPreference("checkbox_force_mtk_max_operating_rate"), hasMtk)
+            }
         }
 
         @Deprecated("Deprecated in Java")
@@ -3031,8 +3046,10 @@ class StreamSettings : ThemedAppCompatActivity() {
                     updateBackgroundPreferenceVisibility(newValue as? String)
                     true
                 }
-            findPreference<Preference>("checkbox_force_mtk_max_operating_rate")?.isVisible =
-                MediaCodecHelper.hasMediaTekDecoder()
+            // MediaCodecList 枚举走 mediaserver binder IPC,主线程等待可能触发 ANR
+            // (Crashlytics 596baf51):先隐藏,探测放到 onViewCreated 里做,结果经
+            // updateRuntimeVisibility 显示,避免与搜索过滤的可见性状态相互覆盖。
+            updateRuntimeVisibility(findPreference("checkbox_force_mtk_max_operating_rate"), false)
 
             // hide on-screen controls category on non touch screen devices
             if (!requireActivity().packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)) {
@@ -3047,10 +3064,36 @@ class StreamSettings : ThemedAppCompatActivity() {
                 findPreference<Preference>("checkbox_absolute_mouse_mode")?.let { it.parent?.removePreference(it) }
             }
 
-            // InputDeviceSensorManager is unsafe on Android 12 and 12L. Keep the device-sensor
-            // fallback visible because it uses the regular SensorManager instead.
+            // Keep the controller-sensor option visible on Android 12/12L as an explicit
+            // compatibility opt-in. The preference migration defaults it off there.
             if (!InputDeviceSensorPolicy.isSupported(Build.VERSION.SDK_INT)) {
                 findPreference<Preference>("checkbox_gamepad_motion_sensors")?.let { it.parent?.removePreference(it) }
+            } else if (!InputDeviceSensorPolicy.isStable(Build.VERSION.SDK_INT)) {
+                findPreference<CheckBoxPreference>("checkbox_gamepad_motion_sensors")?.let { motionPref ->
+                    motionPref.summary = getString(R.string.summary_checkbox_gamepad_motion_sensors_android12)
+                    motionPref.onPreferenceChangeListener = Preference.OnPreferenceChangeListener { _, newValue ->
+                        if (newValue != true) {
+                            true
+                        } else {
+                            appDialogBuilder()
+                                .setTitle(R.string.title_gamepad_motion_sensors_android12_experimental)
+                                .setMessage(R.string.message_gamepad_motion_sensors_android12_experimental)
+                                .setNegativeButton(android.R.string.cancel, null)
+                                .setPositiveButton(android.R.string.ok) { _, _ ->
+                                    PreferenceManager.getDefaultSharedPreferences(requireContext())
+                                        .edit()
+                                        .putBoolean(
+                                            PreferenceConfiguration.GAMEPAD_MOTION_SENSORS_ANDROID12_CONFIRMED_PREF_STRING,
+                                            true
+                                        )
+                                        .apply()
+                                    motionPref.isChecked = true
+                                }
+                                .showStyled()
+                            false
+                        }
+                    }
+                }
             }
 
             // Hide gamepad motion sensor fallback option if the device has no gyro or accelerometer
@@ -3084,12 +3127,18 @@ class StreamSettings : ThemedAppCompatActivity() {
 
             val deviceVibrator = requireActivity().getSystemService(VIBRATOR_SERVICE) as Vibrator
             val deviceRumbleStrength = findPreference<Preference>("seekbar_vibrate_fallback_strength")!!
+            val nativeHapticsSupported = Build.VERSION.SDK_INT >= 29 && NativeAuthoredHaptics.supported()
+            if (!deviceVibrator.hasVibrator() || !nativeHapticsSupported) {
+                findPreference<Preference>("checkbox_native_device_haptics")?.let {
+                    it.parent?.removePreference(it)
+                }
+            }
             // Routing remains useful without a phone motor because controller-only and Smart
             // still work. Only the device-specific strength control should disappear.
             if (!deviceVibrator.hasVibrator()) {
                 deviceRumbleStrength.parent?.removePreference(deviceRumbleStrength)
             } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
-                    !deviceVibrator.hasAmplitudeControl()) {
+                    !deviceVibrator.hasAmplitudeControl() && !nativeHapticsSupported) {
                 // Remove the vibration strength selector of the device doesn't have amplitude control
                 deviceRumbleStrength.parent?.removePreference(deviceRumbleStrength)
             }
@@ -3798,6 +3847,12 @@ class StreamSettings : ThemedAppCompatActivity() {
 
         /** Reapplies preference presentation derived from the changed stored value. */
         private fun refreshSettingsPresentation(changedKey: String? = null) {
+            if (changedKey == null || changedKey in setOf(
+                    "list_ds5_simulation_mode", "list_host_gamepad_selection",
+                    PreferenceConfiguration.GAME_RUMBLE_MODE_PREF_STRING,
+                    "seekbar_vibrate_fallback_strength")) {
+                updateHapticsPreferences()
+            }
             if (changedKey == null || changedKey.contains("float_ball")) {
                 updateFloatBallSettingsSummary()
             }
@@ -3846,6 +3901,23 @@ class StreamSettings : ThemedAppCompatActivity() {
             }
             refreshFeaturePageVisibility(preferenceScreen)
             updateFeaturePageSummaries()
+        }
+
+        private fun updateHapticsPreferences() {
+            val prefs = preferenceManager.sharedPreferences ?: return
+            val host = HostGamepadSelection.fromPreference(
+                prefs.getString("list_host_gamepad_selection", "automatic"))
+            findPreference<Preference>("list_ds5_simulation_mode")?.isEnabled =
+                Ds5SimulationMode.IR_ENHANCED.requestsIr(nativePcm = false, controlOnly = false, host = host)
+            val preference = findPreference<Preference>("checkbox_native_device_haptics") ?: return
+            val enabled = Ds5SimulationMode.fromPreference(
+                prefs.getString("list_ds5_simulation_mode", "legacy")).allowsNativeDeviceHaptics(
+                GameRumbleMode.fromPreferenceValue(prefs.getString(
+                    PreferenceConfiguration.GAME_RUMBLE_MODE_PREF_STRING, "controller")),
+                prefs.getInt("seekbar_vibrate_fallback_strength", 100), host)
+            preference.isEnabled = enabled
+            preference.setSummary(if (enabled) R.string.summary_native_device_haptics
+                else R.string.summary_native_device_haptics_requires_output)
         }
 
         /** Capability filtering can empty a feature or an internal group on older devices. */

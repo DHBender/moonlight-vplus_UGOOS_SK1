@@ -137,8 +137,7 @@ object UpdateManager {
 
     @Suppress("UNUSED_PARAMETER")
     fun checkForUpdatesOnStartup(context: Context) {
-        // Ugoos SK1: do not check for app updates on startup.
-        // Manual update checks still require an explicit user action.
+        // SK1: update checks remain user-initiated only.
     }
 
     /**

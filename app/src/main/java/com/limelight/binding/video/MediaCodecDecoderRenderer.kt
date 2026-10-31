@@ -1,5 +1,6 @@
 package com.limelight.binding.video
 
+import com.limelight.R
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
@@ -46,7 +47,7 @@ class MediaCodecDecoderRenderer(
     private val pyrowaveFailureListener: (String) -> Unit,
 ) : VideoDecoderRenderer() {
 
-    // This dedicated SK1 diagnostic package reconstructs the owner-tested v14 HEVC path.
+    // SK1 v14 low-latency HEVC, retaining new upstream codec/resize logic.
     init { TextureBridge.attach(activity) }
 
     companion object {
@@ -155,6 +156,52 @@ class MediaCodecDecoderRenderer(
      */
     @Volatile
     var firstFrameCallback: (() -> Unit)? = null
+
+    private class PendingResolutionFrame(
+        val tracker: ResolutionFrameTracker,
+        val callback: (Int, Int) -> Unit
+    )
+    @Volatile private var pendingResolutionFrame: PendingResolutionFrame? = null
+
+    fun awaitResolutionFrame(width: Int, height: Int, callback: (Int, Int) -> Unit) {
+        pendingResolutionFrame = PendingResolutionFrame(ResolutionFrameTracker(width, height), callback)
+    }
+
+    fun cancelResolutionFrameWait() { pendingResolutionFrame = null }
+
+    /** Encoded output geometry can differ from the host desktop reported on the control stream. */
+    fun decodedOutputSize(): Pair<Int, Int>? {
+        if (videoFormat == MoonBridge.VIDEO_FORMAT_PYROWAVE) return pyrowaveDecoder.lastPresentedSize
+        return outputFormat?.decodedSize()
+    }
+
+    private fun MediaFormat.decodedSize(): Pair<Int, Int>? = try {
+        val width = if (containsKey("crop-right") && containsKey("crop-left"))
+            getInteger("crop-right") - getInteger("crop-left") + 1
+        else getInteger(MediaFormat.KEY_WIDTH)
+        val height = if (containsKey("crop-bottom") && containsKey("crop-top"))
+            getInteger("crop-bottom") - getInteger("crop-top") + 1
+        else getInteger(MediaFormat.KEY_HEIGHT)
+        (width to height).takeIf { width > 0 && height > 0 }
+    } catch (_: RuntimeException) { null }
+
+    private fun recordResolutionOutput(codec: MediaCodec, index: Int, pts: Long) {
+        val pending = pendingResolutionFrame ?: return
+        try {
+            val (width, height) = codec.getOutputFormat(index).decodedSize() ?: return
+            pending.tracker.decoded(codec, pts, width, height)
+        } catch (_: RuntimeException) {
+            // A codec which cannot report output geometry uses the bounded reconnect fallback.
+        }
+    }
+
+    private fun resolutionFramePresented(codec: MediaCodec, pts: Long) {
+        val pending = pendingResolutionFrame ?: return
+        if (codec === videoDecoder && pending.tracker.presented(codec, pts)) {
+            if (pendingResolutionFrame === pending) pendingResolutionFrame = null
+            pending.callback(pending.tracker.width, pending.tracker.height)
+        }
+    }
     @Volatile
     private var firstFrameDelivered = false
     @Volatile
@@ -1178,7 +1225,7 @@ class MediaCodecDecoderRenderer(
         } catch (e: IOException) {
             e.printStackTrace()
             if (throwOnCodecError) {
-                throw RuntimeException(e)
+                throw IllegalStateException(e)
             }
         } finally {
             if (!configured && videoDecoder != null) {
@@ -1490,7 +1537,8 @@ class MediaCodecDecoderRenderer(
         linearBlockEnabled = false
 
         if (USE_FRAME_RENDER_TIME && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            videoDecoder!!.setOnFrameRenderedListener({ _, presentationTimeUs, renderTimeNanos ->
+            videoDecoder!!.setOnFrameRenderedListener({ codec, presentationTimeUs, renderTimeNanos ->
+                resolutionFramePresented(codec, presentationTimeUs)
                 // 首帧实际显示到 surface 的时刻（最准的"画面已上屏"时机）
                 if (!firstFrameDelivered) {
                     firstFrameDelivered = true
@@ -1567,6 +1615,8 @@ class MediaCodecDecoderRenderer(
             // Common case
             return false
         }
+
+        var recoveryFailure: RendererException? = null
 
         // We need some sort of recovery, so quiesce all threads before starting that
         synchronized(codecRecoveryMonitor) {
@@ -1699,9 +1749,9 @@ class MediaCodecDecoderRenderer(
                             stopping = true
                             codecRecoveryType.set(CR_RECOVERY_TYPE_NONE)
                         } catch (e: IllegalStateException) {
-                            // If we failed to recover after all of these attempts, just crash
-                            notifyCrashOnce(e)
-                            throw RendererException(createDiagnostics(), e)
+                            // End the stream and let the existing recovery cleanup wake waiters.
+                            stopping = true
+                            recoveryFailure = RendererException(createDiagnostics(), e)
                         }
                     }
 
@@ -1746,6 +1796,11 @@ class MediaCodecDecoderRenderer(
             }
         }
 
+        // Report after releasing the monitor so connection teardown can join recovery waiters.
+        recoveryFailure?.let {
+            it.printStackTrace()
+            notifyCrashOnce(it)
+        }
         return true
     }
 
@@ -1927,6 +1982,8 @@ class MediaCodecDecoderRenderer(
             override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: BufferInfo) {
                 if (stopping) return
 
+                recordResolutionOutput(codec, index, info.presentationTimeUs)
+
                 TextureBridge.noteOutput(codec, index, info)
                 numFramesOut++
                 hdr10PlusOutputObserver.observeOutput(codec, index, info.presentationTimeUs)
@@ -2005,6 +2062,7 @@ class MediaCodecDecoderRenderer(
                                     presentationTimeUs = info.presentationTimeUs
                                 }
 
+                                recordResolutionOutput(videoDecoder!!, lastIndex, presentationTimeUs)
                                 if (prefs.framePacing == PreferenceConfiguration.FRAME_PACING_MAX_SMOOTHNESS ||
                                     prefs.framePacing == PreferenceConfiguration.FRAME_PACING_CAP_FPS
                                 ) {
@@ -2021,6 +2079,7 @@ class MediaCodecDecoderRenderer(
                                 frameIntervalTracker.recordFrame()
                             } else {
                                 // Buffered modes: deliver to frame pacing controller
+                                recordResolutionOutput(videoDecoder!!, lastIndex, presentationTimeUs)
                                 framePacingController.offerOutputBuffer(lastIndex)
                             }
 
@@ -2183,6 +2242,7 @@ class MediaCodecDecoderRenderer(
     }
 
     override fun stop() {
+        cancelResolutionFrameWait()
         if (pyrowaveDecoderActive) {
             stopping = true
             return
@@ -2632,6 +2692,13 @@ class MediaCodecDecoderRenderer(
                     // fresh intra frame; a fatal session is reported through
                     // the existing connection callback path.
                     return MoonBridge.DR_NEED_IDR
+                }
+            }
+            pendingResolutionFrame?.let { pending ->
+                val presentedSize = pyrowaveDecoder.lastPresentedSize
+                if (presentedSize?.first == pending.tracker.width && presentedSize.second == pending.tracker.height) {
+                    if (pendingResolutionFrame === pending) pendingResolutionFrame = null
+                    pending.callback(presentedSize.first, presentedSize.second)
                 }
             }
             val nowMs = SystemClock.uptimeMillis()
@@ -3111,8 +3178,8 @@ class MediaCodecDecoderRenderer(
                 totalFramesExpected * 100f
         }
 
-        return String.format(
-            "[精确同步: %d渲染/%d接收, 跳帧率: %.1f%%]",
+        return context.getString(
+            R.string.stats_precise_sync,
             globalVideoStats.totalFramesRendered,
             globalVideoStats.totalFramesReceived,
             skipRate

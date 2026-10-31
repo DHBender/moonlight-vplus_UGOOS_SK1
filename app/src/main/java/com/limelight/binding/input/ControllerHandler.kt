@@ -40,6 +40,7 @@ import com.limelight.binding.input.driver.wireless.dualsense.DirectDualSenseBlue
 import com.limelight.binding.input.haptics.ControllerHapticsCoordinator
 import com.limelight.binding.input.haptics.DualSenseNativeHapticsSink
 import com.limelight.nvstream.Ds5HapticsPcmFrame
+import com.limelight.nvstream.Ds5HapticsState
 import com.limelight.nvstream.NvConnection
 import com.limelight.nvstream.input.ControllerPacket
 import com.limelight.nvstream.input.KeyboardPacket
@@ -411,8 +412,9 @@ class ControllerHandler(
     internal val gyroManager = ControllerGyroManager(this)
     internal val rumbleManager = ControllerRumbleManager(this)
     private val systemWaveformRoutes = ConcurrentHashMap<Int, SystemWaveformRoute>()
+    private val directWaveformRouteIds = ConcurrentHashMap<Int, Int>()
     private val waveformCapabilities = ConcurrentHashMap<Int, HapticRouteSnapshot>()
-    private val retiredWaveformRoutes = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+    private val retiredWaveformRoutes = java.util.Collections.newSetFromMap(ConcurrentHashMap<Int, Boolean>())
     private val hapticsCoordinator = ControllerHapticsCoordinator(this)
     private var directDualSenseBluetoothTransport: AndroidBluetoothHidHostTransport? = null
 
@@ -456,6 +458,7 @@ class ControllerHandler(
                         inputDeviceContexts.valueAt(index)
                             .directDualSenseBluetoothOutput?.onTransportReady()
                     }
+                    refreshDirectBluetoothWaveformRoutes()
                 }
             }.also { it.start() }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
@@ -956,6 +959,7 @@ class ControllerHandler(
         // Flush rumble while device contexts and HOST fallback paths are still available.
         systemWaveformRoutes.values.forEach { it.sink.stop() }
         systemWaveformRoutes.clear()
+        directWaveformRouteIds.clear()
         waveformCapabilities.clear()
         hapticsCoordinator.stop()
 
@@ -1406,7 +1410,11 @@ class ControllerHandler(
                     0, controllerArrivalMetadata[0] ?: ControllerArrivalMetadata(
                         MoonBridge.LI_CTYPE_XBOX, STANDARD_GAMEPAD_BUTTON_FLAGS, 0))
             } else context.sendControllerArrival()
-            context.controllerArrival.recordAttempt(result)
+            context.controllerArrival.recordAttempt(result).also { reported ->
+                if (reported && context is InputDeviceContext) {
+                    mainThreadHandler.post { refreshDirectBluetoothWaveformRoutes() }
+                }
+            }
         }
 
     private fun slotOrder(context: GenericControllerContext): List<Int> =
@@ -1593,8 +1601,9 @@ class ControllerHandler(
 
         // InputDevice sensors were added in Android 12, but Android 12 and 12L can crash on a
         // background SensorThread after InputDeviceSensorManager observes a removed device.
-        // Merely accessing dev.sensorManager creates that manager, so don't touch it before
-        // Android 13. Device-level sensor fallback uses the regular SensorManager and remains safe.
+        // Merely accessing dev.sensorManager creates that manager, so keep it disabled by default
+        // on Android 12/12L. Only the explicit compatibility opt-in may touch it there.
+        // Device-level sensor fallback uses the regular SensorManager and remains safe.
         // https://cs.android.com/android/_/android/platform/frameworks/base/+/8970010a5e9f3dc5c069f56b4147552accfcbbeb
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             InputDeviceSensorPolicy.shouldUse(
@@ -3887,6 +3896,53 @@ class ControllerHandler(
         var inputId: Int? = null, var player: Short? = null
     )
 
+    internal fun releaseDirectBluetoothHaptics(inputId: Int) {
+        directWaveformRouteIds.remove(inputId)?.let { id ->
+            retiredWaveformRoutes.add(id)
+            waveformCapabilities.remove(id)
+            onSystemWaveformSinkGone(id)
+        }
+    }
+
+    private fun refreshDirectBluetoothWaveformRoutes() {
+        if (stopped || !prefConfig.allowExperimentalHaptics || !prefConfig.dualSenseDirectBluetooth) return
+        for (index in 0 until inputDeviceContexts.size()) {
+            val context = inputDeviceContexts.valueAt(index)
+            if (!isContextUsable(context) || !context.hasJoystickAxes) continue
+            val output = context.directDualSenseBluetoothOutput ?: continue
+            val previous = directWaveformRouteIds[context.id]?.let(systemWaveformRoutes::get)
+            if (previous?.player != null && previous.player != context.controllerNumber) {
+                releaseDirectBluetoothHaptics(context.id)
+            }
+            val id = directWaveformRouteIds.getOrPut(context.id) {
+                com.limelight.binding.input.driver.ControllerDriverIdAllocator.allocate()
+            }
+            val route = systemWaveformRoutes.getOrPut(id) {
+                val metadata = HapticRouteSnapshot(id, HapticDeviceIdentity(
+                    "android-bt:${context.id}", context.name ?: "DualSense", context.vendorId, context.productId,
+                    HapticTransport.BLUETOOTH), output.waveformCapability(HapticAvailability.INITIALIZING))
+                waveformCapabilities[id] = metadata
+                val sink = output.createHapticsSink {
+                    mainThreadHandler.post {
+                        if (directWaveformRouteIds[context.id] == id) {
+                            releaseDirectBluetoothHaptics(context.id)
+                        }
+                    }
+                }
+                SystemWaveformRoute(metadata, sink, {}, inputId = context.id)
+            }
+            if (route.player != null || !context.assignedControllerNumber ||
+                !context.controllerArrival.isReported || !output.isWaveformReady) continue
+            route.player = context.controllerNumber
+            hapticsCoordinator.attachWaveformHapticsSink(id, context.controllerNumber, route.sink,
+                sourceActive = { isContextUsable(context) }) { state ->
+                updateWaveformAvailability(id, state)
+                LimeLog.info("DualSense Bluetooth waveform: player=${context.controllerNumber} " +
+                    "state=$state pcmRequested=${conn.authoredPcmHapticsRequested}")
+            }
+        }
+    }
+
     override fun onWaveformRouteChanged(route: HapticRouteSnapshot) {
         if (stopped || route.id in retiredWaveformRoutes) return
         val firstObservation = waveformCapabilities.put(route.id, route) == null
@@ -3930,7 +3986,10 @@ class ControllerHandler(
         .map { snapshot ->
             val route = systemWaveformRoutes[snapshot.id]
             val test = route?.sink?.channelTest
-            HapticRouteView(snapshot, route?.player?.toInt(),
+            val visible = if (snapshot.capability.availability == HapticAvailability.READY &&
+                !conn.authoredPcmHapticsRequested) snapshot.copy(capability = snapshot.capability.copy(
+                    availability = HapticAvailability.NEEDS_RECONNECT)) else snapshot
+            HapticRouteView(visible, route?.player?.toInt(),
                 route?.inputId != null && test?.canTest == true, test?.isTesting == true)
         }
 
@@ -3977,6 +4036,7 @@ class ControllerHandler(
         if (stopped) return
         for ((id, route) in systemWaveformRoutes) {
             val identity = route.metadata.device
+            if (identity.transport != HapticTransport.USB) continue
             if (usbHandoff.blocks(UsbControllerHandoff.Identity(identity.vendorId, identity.productId))) continue
             val devices = InputDevice.getDeviceIds().asSequence().mapNotNull(InputDevice::getDevice).filter {
                 it.vendorId == identity.vendorId && it.productId == identity.productId &&
@@ -4007,6 +4067,7 @@ class ControllerHandler(
                 invalidateSystemWaveformRoute(id, route)
             }
         }
+        refreshDirectBluetoothWaveformRoutes()
     }
 
     override fun onDualSenseNativeHapticsSinkGone(controllerId: Int) {
@@ -4255,7 +4316,17 @@ class ControllerHandler(
     fun handleSetControllerLED(controllerNumber: Short, r: Byte, g: Byte, b: Byte) =
         rumbleManager.handleSetControllerLED(controllerNumber, r, g, b)
 
+    fun handleDs5HapticsIr(frame: com.limelight.nvstream.Ds5HapticsIrFrame) =
+        hapticsCoordinator.submitDs5HapticsIr(frame)
+
+    fun handleDs5HapticsIrExtended(frame: com.limelight.nvstream.Ds5HapticsIrExtendedFrame) =
+        hapticsCoordinator.submitDs5HapticsIrExtended(frame)
+
     fun handleDs5HapticsPcm(frame: Ds5HapticsPcmFrame) {
         hapticsCoordinator.submitDs5HapticsPcm(frame)
+    }
+
+    fun handleDs5HapticsState(controllerNumber: Short, state: Ds5HapticsState) {
+        hapticsCoordinator.submitDs5HapticsState(controllerNumber, state)
     }
 }
