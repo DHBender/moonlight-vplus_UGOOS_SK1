@@ -43,8 +43,12 @@ jobs:
           UPSTREAM_REF=refs/remotes/sk1-upstream/v12.14.3 python3 .github/scripts/sk1-merge-vplus-12.14.3.py
           git add -A
           git diff --cached --check
-          git commit -m "SK1: integrate pinned upstream V+ 12.14.3 and validated HEVC bridge"
-          git push origin "HEAD:$GITHUB_REF_NAME"
+          if git diff --cached --quiet; then
+            echo "Upstream and HEVC source already merged; no new commit"
+          else
+            git commit -m "SK1: integrate pinned upstream V+ 12.14.3 and validated HEVC bridge"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
           echo "SK1_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
       - name: Synchronize native submodules
         run: |
@@ -82,6 +86,7 @@ jobs:
           ./gradlew :app:testNonRootDebugUnitTest :app:assembleNonRootDebug --no-daemon --stacktrace
           test -f app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
           unzip -tqq app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
+          python3 .github/scripts/sk1-audit-hevc-apk.py app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk
           mkdir -p release-files
           cp app/build/outputs/apk/nonRoot/debug/app-nonRoot-debug.apk "release-files/$APK_NAME"
           sha256sum "release-files/$APK_NAME" | tee release-files/SHA256SUMS.txt
@@ -114,8 +119,12 @@ jobs:
           HEVC artifacts were traced to game motion-blur settings.
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release already exists; do not overwrite."
-            exit 1
+            echo "Release already exists; keep tested asset unchanged and verify sha256."
+            expected="$(sha256sum "release-files/$APK_NAME" | cut -d' ' -f1)"
+            existing="$(gh release view "$TAG" --json assets --jq '.assets[] | select(.name == env.APK_NAME) | .digest')"
+            test "$existing" = "sha256:$expected" || { echo "::error::Release artifact differs"; exit 1; }
+            echo "Release asset identical; no overwrite required."
+            exit 0
           fi
           gh release create "$TAG" "release-files/$APK_NAME" "release-files/SHA256SUMS.txt" \
             --target "$SK1_SOURCE_SHA" \
