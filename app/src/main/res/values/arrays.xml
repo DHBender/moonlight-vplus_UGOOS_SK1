@@ -363,6 +363,19 @@
         <item>horizontal</item>
         <item>vertical</item>
     </string-array>
+
+    <string-array name="perf_overlay_style_names">
+        <item>@string/perf_overlay_style_mini</item>
+        <item>@string/perf_overlay_style_standard</item>
+        <item>@string/perf_overlay_style_detailed</item>
+        <item>@string/perf_overlay_style_classic</item>
+    </string-array>
+    <string-array name="perf_overlay_style_values" translatable="false">
+        <item>mini</item>
+        <item>standard</item>
+        <item>detailed</item>
+        <item>classic</item>
+    </string-array>
     
     <!-- Performance overlay position options - horizontal -->
     <string-array name="perf_overlay_position_horizontal_names">
@@ -611,6 +624,7 @@
         <item>@string/float_ball_action_open_menu</item>
         <item>@string/float_ball_action_toggle_visibility</item>
         <item>@string/float_ball_action_show_perf_overlay</item>
+        <item>@string/quick_btn_unlock_host</item>
     </string-array>
     <string-array name="float_ball_action_values" translatable="false">
         <item>none</item>
@@ -618,6 +632,7 @@
         <item>open_menu</item>
         <item>toggle_visibility</item>
         <item>show_perf_overlay</item>
+        <item>unlock_host</item>
     </string-array>
     <string-array name="float_ball_position_entries">
         <item>@string/mic_button_position_top_left</item>
